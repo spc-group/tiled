@@ -6,7 +6,7 @@ import itertools
 import time
 import warnings
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Any, Iterable, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterable, Optional, Union, Generator
 from urllib.parse import parse_qs, urlparse
 
 import entrypoints
@@ -21,6 +21,7 @@ from ..structures.core import StructureFamily
 from ..structures.data_source import DataSource
 from ..utils import UNCHANGED, OneShotCachedMap, Sentinel, node_repr, safe_json_dump
 from .base import STRUCTURE_TYPES, BaseClient
+from .context import send_requests, send_requests_async
 from .utils import (
     MSGPACK_MIME_TYPE,
     ClientError,
@@ -241,7 +242,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                 yield item["id"]
             next_page_url = content["links"]["next"]
 
-    def __getitem__(self, keys, _ignore_inlined_contents=False):
+    def _request_getitem(self, keys, _ignore_inlined_contents=False) -> Generator[httpx.Request, httpx.Response, BaseClient]:
         # These are equivalent:
         #
         # >>> node['a']['b']['c']
@@ -278,12 +279,14 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             link = self.item["links"]["search"]
             for attempt in retry_context():
                 with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
+                    content = handle_error((
+                        self.context.http_client,
+                        self.context.http_client.build_request(
+                            "GET",
                             link,
                             headers={"Accept": MSGPACK_MIME_TYPE},
                             params={**parse_qs(urlparse(link).query), **params},
-                        )
+                        ))
                     ).json()
             self._cached_len = (
                 content["meta"]["count"],
@@ -344,8 +347,10 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                         link = self_link + "".join(f"/{key}" for key in keys[i:])
                         for attempt in retry_context():
                             with attempt:
-                                content = handle_error(
-                                    self.context.http_client.get(
+                                response = yield (
+                                    self.context.http_client,
+                                    self.context.http_client.build_request(
+                                        "GET",
                                         link,
                                         headers={"Accept": MSGPACK_MIME_TYPE},
                                         params={
@@ -353,7 +358,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                                             **params,
                                         },
                                     )
-                                ).json()
+                                )
+                                content = handle_error(response).json()
                     except ClientError as err:
                         if err.response.status_code == httpx.codes.NOT_FOUND:
                             # If this is a scalar lookup, raise KeyError("X") not KeyError(("X",)).
@@ -1176,6 +1182,18 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
 
         return client
 
+    def __getitem__(self, keys, _ignore_inlined_contents=False) -> BaseClient:
+        return send_requests(self._request_getitem(keys, _ignore_inlined_contents))
+
+
+class AsyncContainer(Container):
+
+    async def __getitem__(self, keys, _ignore_inlined_contents=False) -> BaseClient:
+        return await send_requests_async(self._request_getitem(keys, _ignore_inlined_contents))
+
+    def __repr__(self):
+        return f"<AsyncContainer {self.uri}>"
+
 
 def _queries_to_params(*queries):
     "Compute GET params from the queries."
@@ -1276,6 +1294,24 @@ DEFAULT_STRUCTURE_CLIENT_DISPATCH = {
             ),
             "xarray_dataset": _LazyLoad(
                 ("..xarray", Container.__module__), "DaskDatasetClient"
+            ),
+        }
+    ),
+    "numpy_async": OneShotCachedMap(
+        {
+            "container": _Wrap(AsyncContainer),
+            "composite": _LazyLoad(("..composite", Container.__module__), "Composite"),
+            "array": _LazyLoad(("..array", Container.__module__), "ArrayClient"),
+            "awkward": _LazyLoad(("..awkward", Container.__module__), "AwkwardClient"),
+            "dataframe": _LazyLoad(
+                ("..dataframe", Container.__module__), "DataFrameClient"
+            ),
+            "sparse": _LazyLoad(("..sparse", Container.__module__), "SparseClient"),
+            "table": _LazyLoad(
+                ("..dataframe", Container.__module__), "DataFrameClient"
+            ),
+            "xarray_dataset": _LazyLoad(
+                ("..xarray", Container.__module__), "DatasetClient"
             ),
         }
     ),
