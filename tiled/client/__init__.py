@@ -1,5 +1,5 @@
 from ..utils import tree
-from .constructors import from_context, from_profile, from_uri
+from .constructors import from_context, from_profile, from_uri, from_context_async, from_profile_async, from_uri_async
 from .container import ASCENDING, DESCENDING
 from .context import Context
 from .logger import hide_logs, record_history, show_logs

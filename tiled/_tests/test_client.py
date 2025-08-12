@@ -8,6 +8,7 @@ from starlette.status import HTTP_400_BAD_REQUEST
 
 from ..adapters.mapping import MapAdapter
 from ..client import Context, from_context, from_profile, record_history
+from ..client.context import send_requests, send_requests_async
 from ..config import ConfigError
 from ..profiles import load_profiles, paths
 from ..queries import Key
@@ -163,3 +164,30 @@ def test_jump_down_tree():
     with record_history() as h:
         client["e"]["d"]["c"]["b"]["a"]
     assert len(h.requests) == 5
+
+
+def test_send_request(mocker):
+    http_client = mocker.MagicMock()
+    request = httpx.Request("GET", "http://localhost")
+    http_client.send.return_value = "response"
+
+    def my_requester():
+        return (yield (http_client, request))
+    # Check proper client calls were made
+    assert send_requests(my_requester()) == "response"
+    http_client.send.assert_called_once_with(request)
+
+
+@pytest.mark.asyncio
+async def test_send_request_async(mocker):
+    http_client = mocker.AsyncMock()
+    request = httpx.Request("GET", "http://localhost")
+    http_client.send.return_value = "response"
+
+    def my_requester():
+        return (yield (http_client, request))
+    # Check proper client calls were made
+    response = await send_requests_async(my_requester())
+    assert response == "response"
+    http_client.send.assert_called_once_with(request)
+    

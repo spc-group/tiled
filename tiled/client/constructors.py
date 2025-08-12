@@ -1,5 +1,6 @@
 import collections
 import collections.abc
+import functools
 import warnings
 from urllib.parse import parse_qs, urlparse
 
@@ -7,11 +8,11 @@ import httpx
 
 from ..utils import import_object, prepend_to_sys_path
 from .container import DEFAULT_STRUCTURE_CLIENT_DISPATCH, Container
-from .context import DEFAULT_TIMEOUT_PARAMS, UNSET, Context
+from .context import DEFAULT_TIMEOUT_PARAMS, UNSET, Context, send_requests, send_requests_async
 from .utils import MSGPACK_MIME_TYPE, client_for_item, handle_error, retry_context
 
 
-def from_uri(
+def build_from_uri(
     uri,
     structure_clients="numpy",
     *,
@@ -25,6 +26,7 @@ def from_uri(
     headers=None,
     timeout=None,
     include_data_sources=False,
+    awaitable=False,
 ):
     """
     Connect to a Node on a local or remote server.
@@ -78,29 +80,33 @@ For non-interactive authentication, use an API key.
             "Tiled no longer accepts 'prompt_for_reauthentication' parameter. "
             + EXPLAIN_LOGIN
         )
-    context, node_path_parts = Context.from_any_uri(
+    context, node_path_parts = yield from Context.from_any_uri(
         uri,
         api_key=api_key,
         cache=cache,
         headers=headers,
         timeout=timeout,
         verify=verify,
+        awaitable=awaitable,
     )
-    return from_context(
+    yield from context.connect()
+    return (yield from build_from_context(
         context,
         structure_clients=structure_clients,
         node_path_parts=node_path_parts,
         include_data_sources=include_data_sources,
         remember_me=remember_me,
-    )
+        awaitable=awaitable,
+    ))
 
 
-def from_context(
+def build_from_context(
     context: Context,
     structure_clients="numpy",
     node_path_parts=None,
     include_data_sources=False,
     remember_me=True,
+    awaitable: bool = False,
 ):
     """
     Advanced: Connect to a Node using a custom instance of httpx.Client or httpx.AsyncClient.
@@ -120,7 +126,8 @@ def from_context(
         Container.discover_clients_from_entrypoints()
     # Interpret structure_clients="numpy" and structure_clients="dask" shortcuts.
     if isinstance(structure_clients, str):
-        structure_clients = DEFAULT_STRUCTURE_CLIENT_DISPATCH[structure_clients]
+        struct_clients_key = structure_clients + "_async" if awaitable else structure_clients
+        structure_clients = DEFAULT_STRUCTURE_CLIENT_DISPATCH[struct_clients_key]
     # To construct a user-facing client object, we may be required to authenticate.
     # 1. If any API key set, we are already authenticated and there is nothing to do.
     # 2. If there are cached valid credentials for this server, use them.
@@ -139,7 +146,8 @@ def from_context(
         if has_providers:
             found_valid_tokens = remember_me and context.use_cached_tokens()
             if (not found_valid_tokens) and auth_is_required:
-                context.authenticate(remember_me=remember_me)
+                # Bundle the request with the context so other constructors have it
+                yield from ((context, request) for request in context.authenticate(remember_me=remember_me))
     # Context ensures that context.api_uri has a trailing slash.
     item_uri = f"{context.api_uri}metadata/{'/'.join(node_path_parts)}"
     params = parse_qs(urlparse(item_uri).query)
@@ -147,19 +155,20 @@ def from_context(
         params["include_data_sources"] = include_data_sources
     for attempt in retry_context():
         with attempt:
-            content = handle_error(
-                context.http_client.get(
-                    item_uri,
-                    headers={"Accept": MSGPACK_MIME_TYPE},
-                )
-            ).json()
+            request = context.http_client.build_request(
+                "GET",
+                item_uri,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+            )
+            response = yield (context.http_client, request)
+            content = handle_error(response).json()
     item = content["data"]
     return client_for_item(
         context, structure_clients, item, include_data_sources=include_data_sources
     )
 
 
-def from_profile(name, structure_clients=None, **kwargs):
+def build_from_profile(name, structure_clients=None, **kwargs):
     """
     Build a Node based a 'profile' (a named configuration).
 
@@ -258,6 +267,40 @@ def from_profile(name, structure_clients=None, **kwargs):
         context = Context.from_app(
             build_app_from_config(config, source_filepath=filepath),
         )
-        return from_context(context, **merged)
+        yield from context.connect()
+        return (yield from build_from_context(context, **merged))
     else:
-        return from_uri(**merged)
+        return (yield from build_from_uri(**merged))
+
+
+
+@functools.wraps(build_from_context)
+def from_context(*args, **kwargs):
+    return send_requests(build_from_context(*args, **kwargs))
+
+
+@functools.wraps(build_from_uri)
+def from_uri(*args, **kwargs):
+    return send_requests(build_from_uri(*args, **kwargs))
+
+
+@functools.wraps(build_from_profile)
+def from_profile(*args, **kwargs):
+    return send_requests(build_from_profile(*args, **kwargs))
+
+
+@functools.wraps(build_from_context)
+async def from_context_async(*args, **kwargs):
+    return await send_requests_async(build_from_context(*args, **kwargs))
+
+
+@functools.wraps(build_from_uri)
+async def from_uri_async(*args, **kwargs):
+    kwargs.setdefault("awaitable", True)
+    return await send_requests_async(build_from_uri(*args, **kwargs))
+
+
+@functools.wraps(build_from_profile)
+async def from_profile_async(*args, **kwargs):
+    kwargs.setdefault("awaitable", True)
+    return await send_requests_async(build_from_profile(*args, **kwargs))
