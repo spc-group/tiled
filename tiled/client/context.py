@@ -8,6 +8,8 @@ import warnings
 from pathlib import Path
 from typing import List
 from urllib.parse import parse_qs, urlparse
+from collections.abc import Generator
+from typing import Any
 
 import httpx
 import platformdirs
@@ -19,7 +21,7 @@ from .._version import __version__ as tiled_version
 from ..utils import UNSET, DictView, parse_time_string
 from .auth import CannotRefreshAuthentication, TiledAuth, build_refresh_request
 from .decoders import SUPPORTED_DECODERS
-from .transport import Transport
+from .transport import Transport, AsyncTransport
 from .utils import (
     DEFAULT_TIMEOUT_PARAMS,
     MSGPACK_MIME_TYPE,
@@ -115,7 +117,7 @@ def prompt_for_credentials(http_client, providers: List[AboutAuthenticationProvi
             if not password:
                 raise PasswordRejected("Password empty.")
             try:
-                tokens = password_grant(
+                tokens = yield from password_grant(
                     http_client, auth_endpoint, provider, username, password
                 )
             except httpx.HTTPStatusError as err:
@@ -134,7 +136,7 @@ def prompt_for_credentials(http_client, providers: List[AboutAuthenticationProvi
     elif mode == "external":
         # Display link and access code, and try to open web browser.
         # Block while polling the server awaiting confirmation of authorization.
-        tokens = device_code_grant(http_client, auth_endpoint)
+        tokens = yield from device_code_grant(http_client, auth_endpoint)
     else:
         raise ValueError(f"Server has unknown authentication mechanism {mode!r}")
     confirmation_message = spec.confirmation_message
@@ -142,6 +144,39 @@ def prompt_for_credentials(http_client, providers: List[AboutAuthenticationProvi
         username = tokens["identity"]["id"]
         print(confirmation_message.format(id=username))
     return tokens
+
+
+def send_requests[T](requestor: Generator[tuple[httpx.Client | None, httpx.Request], httpx.Response, T]) -> T:
+    """Perform an HTTP request using *http_client* on behalf of *requestor*."""
+    # Prime the generator
+    response = None
+    while True:
+        try:
+            client, request = requestor.send(response)
+        except StopIteration as exc:
+            return exc.value
+        # Create a default client is one is not explicitly requested
+        if client is None:
+            client = httpx.Client()
+        response = client.send(request)
+
+
+async def send_requests_async[T](requestor: Generator[tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T]) -> T:
+    """Perform an HTTP request using an asynchronous *http_client* on behalf of *requestor*."""
+    response = None
+    while True:
+        try:
+            client, request = requestor.send(response)
+        except StopIteration as exc:
+            return exc.value
+        print(request)
+        # Create a default client is one is not explicitly requested
+        if client is None:
+            client = httpx.AsyncClient()
+        try:
+            response = await client.send(request)
+        except Exception as exc:
+            raise
 
 
 class Context:
@@ -160,6 +195,7 @@ class Context:
         verify=True,
         app=None,
         raise_server_exceptions=True,
+        awaitable=False,
     ):
         # The uri is expected to reach the root API route.
         uri = httpx.URL(uri)
@@ -212,8 +248,10 @@ class Context:
         if cache is UNSET:
             cache = None
         if app is None:
-            client = httpx.Client(
-                transport=Transport(cache=cache),
+            Client = httpx.AsyncClient if awaitable else httpx.Client
+            Trnsprt = AsyncTransport if awaitable else Transport
+            client = Client(
+                transport=Trnsprt(cache=cache),
                 verify=verify,
                 timeout=timeout,
                 follow_redirects=True,
@@ -255,7 +293,9 @@ class Context:
         self._verify = verify
         self._cache = cache
         self._token_cache = Path(TILED_CACHE_DIR / "tokens")
+        self._api_key = api_key  # Stash it for use during `connect()`
 
+    def connect(self) -> Generator[httpx.Request, httpx.Response, None]:
         # Make an initial "safe" request to:
         # (1) Get the server_info.
         # (2) Let the server set the CSRF cookie.
@@ -264,16 +304,20 @@ class Context:
         for attempt in retry_context():
             with attempt:
                 server_info = handle_error(
-                    self.http_client.get(
-                        self.api_uri,
-                        headers={
-                            "Accept": MSGPACK_MIME_TYPE,
-                            "Cache-Control": "no-cache, no-store",
-                        },
-                    )
+                    (yield (
+                        self.http_client,
+                        self.http_client.build_request(
+                            "GET",
+                            self.api_uri,
+                            headers={
+                                "Accept": MSGPACK_MIME_TYPE,
+                                "Cache-Control": "no-cache, no-store",
+                            },
+                        )
+                    ))
                 ).json()
         self.server_info: About = TypeAdapter(About).validate_python(server_info)
-        self.api_key = api_key  # property setter sets Authorization header
+        self.api_key = self._api_key  # property setter sets Authorization header
         self.admin = Admin(self)  # accessor for admin-related requests
 
     def __repr__(self):
@@ -326,6 +370,7 @@ class Context:
             self._token_cache,
             self.server_info,
             self.cache,
+            self.awaitable,
         )
 
     def __setstate__(self, state):
@@ -340,6 +385,7 @@ class Context:
             token_cache,
             server_info,
             cache,
+            awaitable,
         ) = state
         if state_tiled_version != tiled_version:
             raise TypeError(
@@ -353,9 +399,11 @@ class Context:
             cookies.set(
                 cookie.name, cookie.value, domain=cookie.domain, path=cookie.path
             )
-        self.http_client = httpx.Client(
+        Client = httpx.AsyncClient if awaitable else httpx.Client
+        Trnsprt = AsyncTransport if awaitable else Transport
+        self.http_client = Client(
             verify=verify,
-            transport=Transport(cache=cache),
+            transport=Trnsprt(cache=cache),
             cookies=cookies,
             timeout=timeout,
             headers=headers,
@@ -378,6 +426,7 @@ class Context:
         timeout=None,
         verify=True,
         app=None,
+        awaitable: bool=False,
     ):
         """
         Accept a URI to a specific node.
@@ -394,7 +443,7 @@ class Context:
         if uri.scheme == "http":
             for attempt in retry_context():
                 with attempt:
-                    response_from_http = httpx.get(uri)
+                    response_from_http = yield (None, httpx.Request("GET", uri))
             if response_from_http.is_redirect:
                 redirect_uri = httpx.URL(response_from_http.headers["location"])
                 if redirect_uri.scheme == "https" and redirect_uri.host == uri.host:
@@ -431,6 +480,7 @@ class Context:
             timeout=timeout,
             verify=verify,
             app=app,
+            awaitable=awaitable,
         )
         return context, node_path_parts
 
@@ -984,7 +1034,7 @@ def password_grant(http_client, auth_endpoint, provider, username, password):
     }
     for attempt in retry_context():
         with attempt:
-            token_response = http_client.post(auth_endpoint, data=form_data, auth=None)
+            token_response = yield (http_client, http_client.build_request("POST", auth_endpoint, data=form_data, auth=None))
             handle_error(token_response)
     return token_response.json()
 
@@ -992,7 +1042,7 @@ def password_grant(http_client, auth_endpoint, provider, username, password):
 def device_code_grant(http_client, auth_endpoint):
     for attempt in retry_context():
         with attempt:
-            verification_response = http_client.post(auth_endpoint, json={}, auth=None)
+            verification_response = yield (http_client, http_client.build_request("POST", auth_endpoint, json={}, auth=None))
             handle_error(verification_response)
     verification = verification_response.json()
     authorization_uri = verification["authorization_uri"]
@@ -1021,14 +1071,14 @@ and enter the code:
             with attempt:
                 # Intentionally do not wrap this in handle_error(...).
                 # Check status codes manually below.
-                access_response = http_client.post(
+                access_response = yield (http_client, http_client.build_request("POST",
                     verification["verification_uri"],
                     json={
                         "device_code": verification["device_code"],
                         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                     },
                     auth=None,
-                )
+                ))
                 if (access_response.status_code == httpx.codes.BAD_REQUEST) and (
                     access_response.json()["detail"]["error"] == "authorization_pending"
                 ):
