@@ -158,7 +158,36 @@ def send_requests[T](requestor: Generator[tuple[httpx.Client | None, httpx.Reque
         # Create a default client is one is not explicitly requested
         if client is None:
             client = httpx.Client()
-        response = client.send(request)
+        for attempt in retry_context():
+            with attempt:
+                response = handle_error(client.send(request))
+
+
+
+def send_requests_generator[T](requestor: Generator[tuple[httpx.Client | None, httpx.Request], httpx.Response, T]) -> Generator[T, Any, None]:
+    """Perform an HTTP request using *http_client* on behalf of *requestor*."""
+    # Prime the generator
+    response = None
+    while True:
+        try:
+            payload = requestor.send(response)
+        except StopIteration as exc:
+            return exc.value
+        # Check if it should be passed through (not an HTTP request)
+        if len(payload) != 2:
+            response = yield payload
+            continue
+        client, request = payload
+        if not isinstance(client, httpx._client.BaseClient):
+            response = yield payload
+            continue
+        # Create a default client is one is not explicitly requested
+        if client is None:
+            client = httpx.Client()
+        # Finally, we can actually execute the request
+        for attempt in retry_context():
+            with attempt:
+                response = handle_error(client.send(request))
 
 
 async def send_requests_async[T](requestor: Generator[tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T]) -> T:
@@ -169,14 +198,37 @@ async def send_requests_async[T](requestor: Generator[tuple[httpx.AsyncClient | 
             client, request = requestor.send(response)
         except StopIteration as exc:
             return exc.value
-        print(request)
         # Create a default client is one is not explicitly requested
         if client is None:
             client = httpx.AsyncClient()
+        for attempt in retry_context():
+            with attempt:
+                response = handle_error(await client.send(request))
+
+
+
+async def send_requests_generator_async[T](requestor: Generator[tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T]) -> Generator[T, Any, None]:
+    """Perform an HTTP request using an asynchronous *http_client* on behalf of *requestor*."""
+    response = None
+    while True:
         try:
-            response = await client.send(request)
-        except Exception as exc:
-            raise
+            payload = requestor.send(response)
+        except StopIteration as exc:
+            return
+        # Check if it should be passed through (not an HTTP request)
+        if len(payload) != 2:
+            response = yield payload
+            continue
+        client, request = payload
+        if not isinstance(client, httpx._client.BaseClient):
+            response = yield payload
+            continue
+        # Create a default client is one is not explicitly requested
+        if client is None:
+            client = httpx.AsyncClient()
+        for attempt in retry_context():
+            with attempt:
+                response = handle_error(await client.send(request))
 
 
 class Context:
@@ -295,6 +347,10 @@ class Context:
         self._token_cache = Path(TILED_CACHE_DIR / "tokens")
         self._api_key = api_key  # Stash it for use during `connect()`
 
+        # Decide how we will we resolve HTTP requests
+        self.send_requests = send_requests_async if awaitable else send_requests
+        self.send_requests_generator = send_requests_generator_async if awaitable else send_requests_generator
+
     def connect(self) -> Generator[httpx.Request, httpx.Response, None]:
         # Make an initial "safe" request to:
         # (1) Get the server_info.
@@ -319,6 +375,14 @@ class Context:
         self.server_info: About = TypeAdapter(About).validate_python(server_info)
         self.api_key = self._api_key  # property setter sets Authorization header
         self.admin = Admin(self)  # accessor for admin-related requests
+
+    def build_request(self, method, url, *args, **kwargs):
+        """Wrapper around httpx.Client.build_request suitable for yielding to
+        `send_requests()`.
+
+        """
+        request = self.http_client.build_request(method, url, *args, **kwargs)
+        return (self.http_client, request)
 
     def __repr__(self):
         auth_info = []
