@@ -14,14 +14,14 @@ import httpx
 import orjson
 
 from ..adapters.utils import IndexersMixin
-from ..iterviews import ItemsView, KeysView, ValuesView
+from ..iterviews import ItemsView, KeysView, ValuesView, AsyncKeysView, AsyncItemsView, AsyncValuesView
 from ..queries import KeyLookup
 from ..query_registration import default_query_registry
 from ..structures.core import StructureFamily
 from ..structures.data_source import DataSource
 from ..utils import UNCHANGED, OneShotCachedMap, Sentinel, node_repr, safe_json_dump
 from .base import STRUCTURE_TYPES, BaseClient
-from .context import send_requests, send_requests_async
+from .context import send_requests, send_requests_async, send_requests_generator, send_requests_generator_async
 from .utils import (
     MSGPACK_MIME_TYPE,
     ClientError,
@@ -169,7 +169,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             **kwargs,
         )
 
-    def __len__(self):
+    def _request_len(self):
         # If the contents of this node was provided in-line, there is an
         # implication that the contents are not expected to be dynamic. Used the
         # count provided in the structure.
@@ -197,6 +197,19 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                         },
                     )
                 ).json()
+        content = (
+            yield self.context.build_request(
+                "GET",
+                link,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+                params={
+                    **parse_qs(urlparse(link).query),
+                    "fields": "count",
+                    **self._queries_as_params,
+                    **self._sorting_params,
+                },
+            )
+        ).json()
         length = content["meta"]["count"]
         self._cached_len = (length, now + LENGTH_CACHE_TTL)
         return length
@@ -206,7 +219,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         # https://www.python.org/dev/peps/pep-0424/
         return len(self)
 
-    def __iter__(self, _ignore_inlined_contents=False):
+    def _request_iter(self, _ignore_inlined_contents=False):
         # If the contents of this node was provided in-line, and we don't need
         # to apply any filtering or sorting, we can slice the in-lined data
         # without fetching anything from the server.
@@ -220,20 +233,19 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             return (yield from contents)
         next_page_url = self.item["links"]["search"]
         while next_page_url is not None:
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
-                            next_page_url,
-                            headers={"Accept": MSGPACK_MIME_TYPE},
-                            params={
-                                **parse_qs(urlparse(next_page_url).query),
-                                "fields": "",
-                                **self._queries_as_params,
-                                **self._sorting_params,
-                            },
-                        )
-                    ).json()
+            content = (
+                yield self.context.build_request(
+                    "GET",
+                    next_page_url,
+                    headers={"Accept": MSGPACK_MIME_TYPE},
+                    params={
+                        **parse_qs(urlparse(next_page_url).query),
+                        "fields": "",
+                        **self._queries_as_params,
+                        **self._sorting_params,
+                    },
+                )
+            ).json()
             self._cached_len = (
                 content["meta"]["count"],
                 time.monotonic() + LENGTH_CACHE_TTL,
@@ -277,17 +289,14 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             if self._include_data_sources:
                 params["include_data_sources"] = True
             link = self.item["links"]["search"]
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error((
-                        self.context.http_client,
-                        self.context.http_client.build_request(
-                            "GET",
-                            link,
-                            headers={"Accept": MSGPACK_MIME_TYPE},
-                            params={**parse_qs(urlparse(link).query), **params},
-                        ))
-                    ).json()
+            content = (
+                yield self.context.build_request(
+                    "GET",
+                    link,
+                    headers={"Accept": MSGPACK_MIME_TYPE},
+                    params={**parse_qs(urlparse(link).query), **params},
+                )
+            ).json()
             self._cached_len = (
                 content["meta"]["count"],
                 time.monotonic() + LENGTH_CACHE_TTL,
@@ -345,21 +354,17 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                         if self._include_data_sources:
                             params["include_data_sources"] = True
                         link = self_link + "".join(f"/{key}" for key in keys[i:])
-                        for attempt in retry_context():
-                            with attempt:
-                                response = yield (
-                                    self.context.http_client,
-                                    self.context.http_client.build_request(
-                                        "GET",
-                                        link,
-                                        headers={"Accept": MSGPACK_MIME_TYPE},
-                                        params={
-                                            **parse_qs(urlparse(link).query),
-                                            **params,
-                                        },
-                                    )
-                                )
-                                content = handle_error(response).json()
+                        content = (
+                            yield self.context.build_request(
+                                "GET",
+                                link,
+                                headers={"Accept": MSGPACK_MIME_TYPE},
+                                params={
+                                    **parse_qs(urlparse(link).query),
+                                    **params,
+                                },
+                            )
+                        ).json()
                     except ClientError as err:
                         if err.response.status_code == httpx.codes.NOT_FOUND:
                             # If this is a scalar lookup, raise KeyError("X") not KeyError(("X",)).
@@ -420,7 +425,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
 
     # The following two methods are used by keys(), values(), items().
 
-    def _keys_slice(
+    def _request_keys_slice(
         self, start, stop, direction, page_size=None, *, _ignore_inlined_contents=False
     ):
         # If the contents of this node was provided in-line, and we don't need
@@ -448,20 +453,19 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             next_page_url += f"&page[limit]={page_size}"
         item_counter = itertools.count(start)
         while next_page_url is not None:
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
-                            next_page_url,
-                            headers={"Accept": MSGPACK_MIME_TYPE},
-                            params={
-                                **parse_qs(urlparse(next_page_url).query),
-                                "fields": "",
-                                **self._queries_as_params,
-                                **sorting_params,
-                            },
-                        )
-                    ).json()
+            content = (
+                yield self.context.build_request(
+                    "GET",
+                    next_page_url,
+                    headers={"Accept": MSGPACK_MIME_TYPE},
+                    params={
+                        **parse_qs(urlparse(next_page_url).query),
+                        "fields": "",
+                        **self._queries_as_params,
+                        **sorting_params,
+                    },
+                )
+            ).json()
             self._cached_len = (
                 content["meta"]["count"],
                 time.monotonic() + LENGTH_CACHE_TTL,
@@ -472,7 +476,11 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                     return
             next_page_url = content["links"]["next"]
 
-    def _items_slice(
+    @functools.wraps(_request_keys_slice)
+    def _keys_slice(self, *args, **kwargs):
+        return self.context.send_requests_generator(self._request_keys_slice(*args, **kwargs))
+
+    def _request_items_slice(
         self, start, stop, direction, page_size=None, *, _ignore_inlined_contents=False
     ):
         # If the contents of this node was provided in-line, and we don't need
@@ -514,15 +522,14 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             }
             if self._include_data_sources:
                 params["include_data_sources"] = True
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
-                            next_page_url,
-                            headers={"Accept": MSGPACK_MIME_TYPE},
-                            params=params,
-                        )
-                    ).json()
+            content = (
+                yield self.context.build_request(
+                    "GET",
+                    next_page_url,
+                    headers={"Accept": MSGPACK_MIME_TYPE},
+                    params=params,
+                )
+            ).json()
             self._cached_len = (
                 content["meta"]["count"],
                 time.monotonic() + LENGTH_CACHE_TTL,
@@ -538,6 +545,10 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                 if stop is not None and next(item_counter) == stop - 1:
                     return
             next_page_url = content["links"]["next"]
+
+    @functools.wraps(_request_items_slice)
+    def _items_slice(self, *args, **kwargs):
+        return self.context.send_requests_generator(self._request_items_slice(*args, **kwargs))
 
     def keys(self):
         return KeysView(lambda: len(self), self._keys_slice)
@@ -560,7 +571,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         """
         return self.new_variation(queries=self._queries + [query])
 
-    def distinct(
+    def _request_distinct(
         self, *metadata_keys, structure_families=False, specs=False, counts=False
     ):
         """
@@ -580,22 +591,21 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         """
 
         link = self.item["links"]["self"].replace("/metadata", "/distinct", 1)
-        for attempt in retry_context():
-            with attempt:
-                distinct = handle_error(
-                    self.context.http_client.get(
-                        link,
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                        params={
-                            **parse_qs(urlparse(link).query),
-                            "metadata": metadata_keys,
-                            "structure_families": structure_families,
-                            "specs": specs,
-                            "counts": counts,
-                            **self._queries_as_params,
-                        },
-                    )
-                ).json()
+        distinct = (
+            yield self.context.build_request(
+                "GET",
+                link,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+                params={
+                    **parse_qs(urlparse(link).query),
+                    "metadata": metadata_keys,
+                    "structure_families": structure_families,
+                    "specs": specs,
+                    "counts": counts,
+                    **self._queries_as_params,
+                },
+            )
+        ).json()
         return distinct
 
     def sort(self, *sorting):
@@ -1183,16 +1193,47 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         return client
 
     def __getitem__(self, keys, _ignore_inlined_contents=False) -> BaseClient:
-        return send_requests(self._request_getitem(keys, _ignore_inlined_contents))
+        return self.context.send_requests(self._request_getitem(keys, _ignore_inlined_contents))
+
+    def __len__(self) -> int:
+        return self.context.send_requests(self._request_len())
+
+    @functools.wraps(_request_distinct)
+    def distinct(self, *args, **kwargs):
+        return self.context.send_requests(self._request_distinct(*args, **kwargs))
+
+    @functools.wraps(_request_iter)
+    def __iter__(self, *args, **kwargs):
+        yield from self.context.send_requests_generator(self._request_iter(*args, **kwargs))
 
 
 class AsyncContainer(Container):
 
-    async def __getitem__(self, keys, _ignore_inlined_contents=False) -> BaseClient:
-        return await send_requests_async(self._request_getitem(keys, _ignore_inlined_contents))
-
     def __repr__(self):
         return f"<AsyncContainer {self.uri}>"
+
+    def keys(self):
+        return AsyncKeysView(lambda: len(self), self._keys_slice)
+
+    def values(self):
+        return AsyncValuesView(lambda: len(self), self._items_slice)
+
+    def items(self):
+        return AsyncItemsView(lambda: len(self), self._items_slice)
+
+    @functools.wraps(Container._request_iter)
+    async def __aiter__(self, *args, **kwargs):
+        async for obj in self.context.send_requests_generator(self._request_iter(*args, **kwargs)):
+            yield obj
+
+    # async def __getitem__(self, keys, _ignore_inlined_contents=False) -> BaseClient:
+    #     return await self.context.send_requests(self._request_getitem(keys, _ignore_inlined_contents))
+
+    # async def get(self, key, default=None) -> BaseClient:
+    #     try:
+    #         return await self[key]
+    #     except KeyError:
+    #         return default
 
 
 def _queries_to_params(*queries):
