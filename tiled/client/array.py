@@ -1,6 +1,8 @@
 import itertools
+from collections.abc import Generator
 from typing import Union
 from urllib.parse import parse_qs, urlparse
+import functools
 
 import dask
 import dask.array
@@ -10,6 +12,7 @@ from numpy.typing import NDArray
 
 from ..structures.core import STRUCTURE_TYPES
 from .base import BaseClient
+from .context import requestor
 from .utils import (
     chunks_repr,
     export_util,
@@ -73,6 +76,7 @@ class _DaskArrayClient(BaseClient):
     def __array__(self, *args, **kwargs):
         return self.read().__array__(*args, **kwargs)
 
+    @requestor()
     def _get_block(self, block, dtype, shape, slice=None):
         """
         Fetch the actual data for one block in a chunked (dask) array.
@@ -100,19 +104,18 @@ class _DaskArrayClient(BaseClient):
         else:
             expected_shape = "scalar"
         url_path = self.item["links"]["block"]
-        for attempt in retry_context():
-            with attempt:
-                content = handle_error(
-                    self.context.http_client.get(
-                        url_path,
-                        headers={"Accept": media_type},
-                        params={
-                            **parse_qs(urlparse(url_path).query),
-                            "block": ",".join(map(str, block)),
-                            "expected_shape": expected_shape,
-                        },
-                    )
-                ).read()
+        content = (
+            yield self.context.build_request(
+                "GET",
+                url_path,
+                headers={"Accept": media_type},
+                params={
+                    **parse_qs(urlparse(url_path).query),
+                    "block": ",".join(map(str, block)),
+                    "expected_shape": expected_shape,
+                },
+            )
+        ).read()
         return numpy.frombuffer(content, dtype=dtype).reshape(shape)
 
     def read_block(self, block, slice=None):
@@ -173,34 +176,31 @@ class _DaskArrayClient(BaseClient):
             dask_array = dask_array[slice]
         return dask_array
 
+    @requestor()
     def write(self, array):
-        for attempt in retry_context():
-            with attempt:
-                handle_error(
-                    self.context.http_client.put(
-                        self.item["links"]["full"],
-                        content=array.tobytes(),
-                        headers={"Content-Type": "application/octet-stream"},
-                    )
-                )
+        yield self.context.build_request(
+            "PUT",
+            self.item["links"]["full"],
+            content=array.tobytes(),
+            headers={"Content-Type": "application/octet-stream"},
+        )
 
+    @requestor()
     def write_block(self, array, block, slice=...):
         url_path = self.item["links"]["block"].format(*block)
         params = {
             **parse_qs(urlparse(url_path).query),
             **params_from_slice(slice),
         }
-        for attempt in retry_context():
-            with attempt:
-                handle_error(
-                    self.context.http_client.put(
-                        url_path,
-                        content=array.tobytes(),
-                        headers={"Content-Type": "application/octet-stream"},
-                        params=params,
-                    )
-                )
+        yield self.context.build_request(
+            "PUT",
+            url_path,
+            content=array.tobytes(),
+            headers={"Content-Type": "application/octet-stream"},
+            params=params,
+        )
 
+    @requestor()
     def patch(self, array: NDArray, offset: Union[int, tuple[int, ...]], extend=False):
         """
         Write data into a slice of an array, maybe extending the shape.
@@ -268,21 +268,24 @@ class _DaskArrayClient(BaseClient):
             "shape": ",".join(map(str, array_.shape)),
             "extend": bool(extend),
         }
-        for attempt in retry_context():
-            with attempt:
-                response = self.context.http_client.patch(
+        try:
+            response = (
+                yield from self.context.build_request(
+                    "PATCH",
                     url_path,
                     content=array_.tobytes(),
                     headers={"Content-Type": "application/octet-stream"},
                     params=params,
                 )
-                if response.status_code == httpx.codes.CONFLICT:
-                    raise ValueError(
-                        f"Slice {slice} does not fit within current array shape. "
-                        "Pass keyword argument extend=True to extend the array "
-                        "dimensions to fit."
-                    )
-                handle_error(response)
+            )
+        except httpx.StatusError as exc:
+            if hasattr(exc, "response") and exc.response.status_code == httpx.codes.CONFLICT:
+                exc = ValueError(
+                    f"Slice {slice} does not fit within current array shape. "
+                    "Pass keyword argument extend=True to extend the array "
+                    "dimensions to fit."
+                )
+            raise exc
         # Update cached structure.
         new_structure = response.json()
         structure_type = STRUCTURE_TYPES[self.structure_family]
@@ -298,9 +301,8 @@ class _DaskArrayClient(BaseClient):
         # As with numpy, len(arr) is the size of the zeroth axis.
         return self.structure().shape[0]
 
-    def export(
-        self, filepath, *, format=None, slice=None, link=None, template_vars=None
-    ):
+    @requestor()
+    def export(self, filepath, *, format=None, slice=None, link=None, template_vars=None):
         """
         Download data in some format and write to a file.
 
@@ -338,13 +340,13 @@ class _DaskArrayClient(BaseClient):
             link = "full"
         template_vars = template_vars or {}
         params = params_from_slice(slice)
-        return export_util(
+        return (yield from export_util(
             filepath,
             format,
-            self.context.http_client.get,
+            self.context.build_request,
             self.item["links"][link].format(**template_vars),
             params=params,
-        )
+        ))
 
 
 # Subclass with a public class that adds the dask-specific methods.
@@ -356,6 +358,28 @@ class DaskArrayClient(_DaskArrayClient):
     def compute(self):
         "Alias to client.read().compute()"
         return self.read().compute()
+
+
+class DaskAsyncArrayClient(_DaskArrayClient):
+    """Asynchronous client-side wrapper around an array-like that returns dask arrays.
+
+    Since dask defers processing until needed, the
+    ``DaskAsyncArrayClient.read()`` method is still synchronous since
+    it does not cause any network I/O. The resulting
+    `dask.array.Array` has a compute method that produces the
+    coroutine responsible for network I/O. Awaiting this coroutine
+    will provide the underlying numpy array.
+
+    >>> client = await tiled.client.from_uri_async('http://localhost:8000')
+    >>> arr_client = await client['nested_array']
+    >>> dask_array = arr_client.read()  # <- not awaited, deferred execution
+    >>> np_array = await dask_array.compute()
+
+    """
+
+    async def compute(self):
+        "Alias to client.read().compute()"
+        return await self.read().compute()
 
 
 class ArrayClient(DaskArrayClient):
@@ -374,3 +398,22 @@ class ArrayClient(DaskArrayClient):
         Optionally, access only a slice *within* this block.
         """
         return super().read_block(block, slice).compute()
+
+
+class AsyncArrayClient(DaskArrayClient):
+    "Asynchronous client-side wrapper around an array-like that returns in-memory arrays"
+
+    async def read(self, slice=None):
+        """
+        Access the entire array or a slice.
+        """
+        return await super().read(slice).compute()
+
+    async def read_block(self, block, slice=None):
+        """
+        Access the data for one block of this chunked array.
+
+        Optionally, access only a slice *within* this block.
+        """
+        return await super().read_block(block, slice).compute()
+    
