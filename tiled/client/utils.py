@@ -1,7 +1,7 @@
 import builtins
 import os
 import uuid
-from collections.abc import Hashable
+from collections.abc import Hashable, Generator
 from dataclasses import asdict
 from pathlib import Path
 from threading import Lock
@@ -178,7 +178,7 @@ class UnknownStructureFamily(KeyError):
     pass
 
 
-def export_util(file, format, get, link, params):
+def export_util(file, format, build, link, params) -> Generator[httpx.Request, httpx.Response, None]:
     """
     Download client data in some format and write to a file.
 
@@ -192,8 +192,8 @@ def export_util(file, format, get, link, params):
         If format is None and `file` is a filepath, the format is inferred
         from the name, like 'table.csv' implies format="text/csv". The format
         may be given as a file extension ("csv") or a media type ("text/csv").
-    get : callable
-        Client's internal GET method
+    build : callable
+        Client's internal build_request method
     link: str
         URL to download full data
     params : dict
@@ -213,18 +213,17 @@ def export_util(file, format, get, link, params):
             format = ".".join(
                 suffix[1:] for suffix in Path(file).suffixes
             )  # e.g. "csv"
-        for attempt in retry_context():
-            with attempt:
-                content = handle_error(
-                    get(
-                        link,
-                        params={
-                            **parse_qs(urlparse(link).query),
-                            "format": format,
-                            **params,
-                        },
-                    )
-                ).read()
+        content = (
+            yield build(
+                "GET",
+                link,
+                params={
+                    **parse_qs(urlparse(link).query),
+                    "format": format,
+                    **params,
+                },
+            )
+        ).read()
         with open(file, "wb") as buffer:
             buffer.write(content)
     else:
@@ -232,18 +231,17 @@ def export_util(file, format, get, link, params):
         if format is None:
             # We have no filepath to infer to format from.
             raise ValueError("format must be specified when file is writeable buffer")
-        for attempt in retry_context():
-            with attempt:
-                content = handle_error(
-                    get(
-                        link,
-                        params={
-                            **parse_qs(urlparse(link).query),
-                            "format": format,
-                            **params,
-                        },
-                    )
-                ).read()
+        content = (
+            yield from build(
+                "GET",
+                link,
+                params={
+                    **parse_qs(urlparse(link).query),
+                    "format": format,
+                    **params,
+                },
+            )
+        ).read()
         file.write(content)
 
 

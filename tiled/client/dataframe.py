@@ -1,14 +1,18 @@
 import functools
 import warnings
+from collections.abc import Generator
 from urllib.parse import parse_qs, urlparse
+
 
 import dask
 import dask.dataframe
+import pandas as pd
 import httpx
 
 from ..serialization.table import deserialize_arrow, serialize_arrow
 from ..utils import APACHE_ARROW_FILE_MIME_TYPE, UNCHANGED
 from .base import BaseClient
+from .context import requestor
 from .utils import (
     MSGPACK_MIME_TYPE,
     ClientError,
@@ -103,7 +107,8 @@ class _DaskDataFrameClient(BaseClient):
     def columns(self):
         return self.structure().columns
 
-    def _get_partition(self, partition, columns):
+    @requestor()
+    def _get_partition(self, partition, columns) -> pd.DataFrame:
         """
         Fetch the actual data for one partition in a partitioned (dask) dataframe.
 
@@ -115,30 +120,28 @@ class _DaskDataFrameClient(BaseClient):
             _EXTRA_CHARS_PER_ITEM + len(column) for column in (columns or ())
         )
         if url_length_for_get_request > self.URL_CHARACTER_LIMIT:
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.post(
-                            URL_PATH,
-                            headers={"Accept": APACHE_ARROW_FILE_MIME_TYPE},
-                            json=columns,
-                            params=params,
-                        )
-                    ).read()
+            content = (
+                yield self.context.build_request(
+                    "POST",
+                    URL_PATH,
+                    headers={"Accept": APACHE_ARROW_FILE_MIME_TYPE},
+                    json=columns,
+                    params=params,
+                )
+            ).read()
         else:
             if columns:
                 # Note: The singular/plural inconsistency here is because
                 # ["A", "B"] will be encoded in the URL as column=A&column=B
                 params["column"] = columns
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
-                            URL_PATH,
-                            headers={"Accept": APACHE_ARROW_FILE_MIME_TYPE},
-                            params=params,
-                        )
-                    ).read()
+            content = (
+                yield self.context.build_request(
+                    "GET",
+                    URL_PATH,
+                    headers={"Accept": APACHE_ARROW_FILE_MIME_TYPE},
+                    params=params,
+                )
+            ).read()
         return deserialize_arrow(content)
 
     def read_partition(self, partition, columns=None):
@@ -191,19 +194,19 @@ class _DaskDataFrameClient(BaseClient):
     # `len(list(obj)) == # len(obj)` for Mappings. Additionally, their behavior
     # with `__getitem__` is a bit "extra", e.g. df[["A", "B"]].
 
-    def __getitem__(self, column):
+    @requestor()
+    def __getitem__(self, column) -> BaseClient:
         try:
             self_link = self.item["links"]["self"]
             if self_link.endswith("/"):
                 self_link = self_link[:-1]
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
-                            self_link + f"/{column}",
-                            headers={"Accept": MSGPACK_MIME_TYPE},
-                        )
-                    ).json()
+            content = (
+                yield self.context.build_request(
+                    "GET",
+                    self_link + f"/{column}",
+                    headers={"Accept": MSGPACK_MIME_TYPE},
+                )
+            ).json()
         except ClientError as err:
             if err.response.status_code == httpx.codes.NOT_FOUND:
                 raise KeyError(column)
@@ -217,19 +220,18 @@ class _DaskDataFrameClient(BaseClient):
     # __len__ is intentionally not implemented. For DataFrames it means "number
     # of rows" which is expensive to compute.
 
+    @requestor()
     def write(self, dataframe):
-        for attempt in retry_context():
-            with attempt:
-                handle_error(
-                    self.context.http_client.put(
-                        self.item["links"]["full"],
-                        content=bytes(
-                            serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})
-                        ),
-                        headers={"Content-Type": APACHE_ARROW_FILE_MIME_TYPE},
-                    )
-                )
+        yield self.context.build_request(
+            "PUT",
+            self.item["links"]["full"],
+            content=bytes(
+                serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})
+            ),
+            headers={"Content-Type": APACHE_ARROW_FILE_MIME_TYPE},
+        )
 
+    @requestor()
     def write_partition(self, partition, dataframe):
         # The order of arguments has changed; check that the user input is correct
         if not isinstance(partition, int):
@@ -240,18 +242,16 @@ class _DaskDataFrameClient(BaseClient):
             )
             partition, dataframe = dataframe, partition
 
-        for attempt in retry_context():
-            with attempt:
-                handle_error(
-                    self.context.http_client.put(
-                        self.item["links"]["partition"].format(index=partition),
-                        content=bytes(
-                            serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})
-                        ),
-                        headers={"Content-Type": APACHE_ARROW_FILE_MIME_TYPE},
-                    )
-                )
+        yield self.context.build_request(
+            "PUT",
+            self.item["links"]["partition"].format(index=partition),
+            content=bytes(
+                serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})
+            ),
+            headers={"Content-Type": APACHE_ARROW_FILE_MIME_TYPE},
+        )
 
+    @requestor()
     def append_partition(self, partition, dataframe):
         # The order of arguments has changed; check that the user input is correct
         if not isinstance(partition, int):
@@ -261,21 +261,18 @@ class _DaskDataFrameClient(BaseClient):
                 stacklevel=2,
             )
             partition, dataframe = dataframe, partition
-
         if partition > self.structure().npartitions:
             raise ValueError(f"Table has {self.structure().npartitions} partitions")
-        for attempt in retry_context():
-            with attempt:
-                handle_error(
-                    self.context.http_client.patch(
-                        self.item["links"]["partition"].format(index=partition),
-                        content=bytes(
-                            serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})
-                        ),
-                        headers={"Content-Type": APACHE_ARROW_FILE_MIME_TYPE},
-                    )
-                )
+        self.context.build_request(
+            "PATCH",
+            self.item["links"]["partition"].format(index=partition),
+            content=bytes(
+                serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})
+            ),
+            headers={"Content-Type": APACHE_ARROW_FILE_MIME_TYPE},
+        )
 
+    @requestor()
     def export(self, filepath, columns=None, *, format=None):
         """
         Download data in some format and write to a file.
@@ -294,13 +291,14 @@ class _DaskDataFrameClient(BaseClient):
         params = {}
         if columns is not None:
             params["column"] = columns
-        return export_util(
+
+        return (yield from export_util(
             filepath,
             format,
-            self.context.http_client.get,
+            self.context.build_request,
             self.item["links"]["full"],
             params=params,
-        )
+        ))
 
 
 # Subclass with a public class that adds the dask-specific methods.
