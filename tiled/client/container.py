@@ -21,7 +21,7 @@ from ..structures.core import StructureFamily
 from ..structures.data_source import DataSource
 from ..utils import UNCHANGED, OneShotCachedMap, Sentinel, node_repr, safe_json_dump
 from .base import STRUCTURE_TYPES, BaseClient
-from .context import send_requests, send_requests_async, send_requests_generator, send_requests_generator_async
+from .context import send_requests, send_requests_async, send_requests_generator, send_requests_generator_async, requestor
 from .utils import (
     MSGPACK_MIME_TYPE,
     ClientError,
@@ -169,7 +169,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             **kwargs,
         )
 
-    def _request_len(self):
+    @requestor()
+    def __len__(self):
         # If the contents of this node was provided in-line, there is an
         # implication that the contents are not expected to be dynamic. Used the
         # count provided in the structure.
@@ -219,7 +220,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         # https://www.python.org/dev/peps/pep-0424/
         return len(self)
 
-    def _request_iter(self, _ignore_inlined_contents=False):
+    @requestor(generator=True)
+    def __iter__(self, _ignore_inlined_contents=False):
         # If the contents of this node was provided in-line, and we don't need
         # to apply any filtering or sorting, we can slice the in-lined data
         # without fetching anything from the server.
@@ -254,7 +256,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                 yield item["id"]
             next_page_url = content["links"]["next"]
 
-    def _request_getitem(self, keys, _ignore_inlined_contents=False) -> Generator[httpx.Request, httpx.Response, BaseClient]:
+    @requestor()
+    def __getitem__(self, keys, _ignore_inlined_contents=False) -> Generator[httpx.Request, httpx.Response, BaseClient]:
         # These are equivalent:
         #
         # >>> node['a']['b']['c']
@@ -384,6 +387,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             )
         return result
 
+    @requestor()
     def delete_contents(
         self,
         keys: Optional[Union[str, Iterable[str]]] = None,
@@ -409,23 +413,21 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             keys = self.keys()
         keys = [keys] if isinstance(keys, str) else keys
         for key in set(keys):
-            for attempt in retry_context():
-                with attempt:
-                    handle_error(
-                        self.context.http_client.delete(
-                            f"{self.uri}/{key}",
-                            params={
-                                "recursive": recursive,
-                                "external_only": external_only,
-                            },
-                        )
-                    )
+            yield self.context.build_request(
+                "DELETE",
+                f"{self.uri}/{key}",
+                params={
+                    "recursive": recursive,
+                    "external_only": external_only,
+                },
+            )
 
         return self
 
     # The following two methods are used by keys(), values(), items().
 
-    def _request_keys_slice(
+    @requestor(generator=True)
+    def _keys_slice(
         self, start, stop, direction, page_size=None, *, _ignore_inlined_contents=False
     ):
         # If the contents of this node was provided in-line, and we don't need
@@ -476,11 +478,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                     return
             next_page_url = content["links"]["next"]
 
-    @functools.wraps(_request_keys_slice)
-    def _keys_slice(self, *args, **kwargs):
-        return self.context.send_requests_generator(self._request_keys_slice(*args, **kwargs))
-
-    def _request_items_slice(
+    @requestor(generator=True)
+    def _items_slice(
         self, start, stop, direction, page_size=None, *, _ignore_inlined_contents=False
     ):
         # If the contents of this node was provided in-line, and we don't need
@@ -546,10 +545,6 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                     return
             next_page_url = content["links"]["next"]
 
-    @functools.wraps(_request_items_slice)
-    def _items_slice(self, *args, **kwargs):
-        return self.context.send_requests_generator(self._request_items_slice(*args, **kwargs))
-
     def keys(self):
         return KeysView(lambda: len(self), self._keys_slice)
 
@@ -571,7 +566,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         """
         return self.new_variation(queries=self._queries + [query])
 
-    def _request_distinct(
+    @requestor()
+    def distinct(
         self, *metadata_keys, structure_families=False, specs=False, counts=False
     ):
         """
@@ -625,7 +621,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         """
         return self.new_variation(sorting=sorting)
 
-    def _request_export(self, filepath, fields=None, *, format=None):
+    @requestor()
+    def export(self, filepath, fields=None, *, format=None):
         """
         Download metadata and data below this node in some format and write to a file.
 
@@ -658,10 +655,6 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             self.item["links"]["full"],
             params=params,
         ))
-
-    @functools.wraps(_request_export)
-    def export(self, *args, **kwargs):
-        return self.context.send_requests(self._request_export(*args, **kwargs))
 
     def _ipython_key_completions_(self):
         """
@@ -728,15 +721,14 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         else:
             endpoint = self.uri
 
-        for attempt in retry_context():
-            with attempt:
-                document = handle_error(
-                    self.context.http_client.post(
-                        endpoint,
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                        content=safe_json_dump(body),
-                    )
-                ).json()
+        document = (
+            yield self.context.build_request(
+                "POST",
+                endpoint,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+                content=safe_json_dump(body),
+            )
+        ).json()
 
         if structure_family == StructureFamily.container:
             structure = {"contents": None, "count": None}
@@ -1196,20 +1188,6 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
 
         return client
 
-    def __getitem__(self, keys, _ignore_inlined_contents=False) -> BaseClient:
-        return self.context.send_requests(self._request_getitem(keys, _ignore_inlined_contents))
-
-    def __len__(self) -> int:
-        return self.context.send_requests(self._request_len())
-
-    @functools.wraps(_request_distinct)
-    def distinct(self, *args, **kwargs):
-        return self.context.send_requests(self._request_distinct(*args, **kwargs))
-
-    @functools.wraps(_request_iter)
-    def __iter__(self, *args, **kwargs):
-        yield from self.context.send_requests_generator(self._request_iter(*args, **kwargs))
-
 
 class AsyncContainer(Container):
 
@@ -1225,19 +1203,10 @@ class AsyncContainer(Container):
     def items(self):
         return AsyncItemsView(lambda: len(self), self._items_slice)
 
-    @functools.wraps(Container._request_iter)
-    async def __aiter__(self, *args, **kwargs):
-        async for obj in self.context.send_requests_generator(self._request_iter(*args, **kwargs)):
-            yield obj
+    async def __aiter__(self, _ignore_inlined_contents=False):
+        async for item in self.__iter__(_ignore_inlined_contents):
+            yield item
 
-    # async def __getitem__(self, keys, _ignore_inlined_contents=False) -> BaseClient:
-    #     return await self.context.send_requests(self._request_getitem(keys, _ignore_inlined_contents))
-
-    # async def get(self, key, default=None) -> BaseClient:
-    #     try:
-    #         return await self[key]
-    #     except KeyError:
-    #         return default
 
 
 def _queries_to_params(*queries):
