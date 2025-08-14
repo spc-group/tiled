@@ -1,3 +1,4 @@
+import functools
 import getpass
 import os
 import re
@@ -8,7 +9,7 @@ import warnings
 from pathlib import Path
 from typing import List
 from urllib.parse import parse_qs, urlparse
-from collections.abc import Generator
+from collections.abc import Generator, Callable
 from typing import Any
 
 import httpx
@@ -158,10 +159,13 @@ def send_requests[T](requestor: Generator[tuple[httpx.Client | None, httpx.Reque
         # Create a default client is one is not explicitly requested
         if client is None:
             client = httpx.Client()
-        for attempt in retry_context():
-            with attempt:
-                response = handle_error(client.send(request))
-
+        # Finally, we can actually execute the request
+        try:
+            for attempt in retry_context():
+                with attempt:
+                    response = handle_error(client.send(request))
+        except Exception as exc:
+            requestor.throw(exc)
 
 
 def send_requests_generator[T](requestor: Generator[tuple[httpx.Client | None, httpx.Request], httpx.Response, T]) -> Generator[T, Any, None]:
@@ -173,21 +177,22 @@ def send_requests_generator[T](requestor: Generator[tuple[httpx.Client | None, h
             payload = requestor.send(response)
         except StopIteration as exc:
             return exc.value
-        # Check if it should be passed through (not an HTTP request)
-        if len(payload) != 2:
-            response = yield payload
-            continue
-        client, request = payload
-        if not isinstance(client, httpx._client.BaseClient):
+        # Check if yielded item should be passed through (not an HTTP request)
+        is_http_request = len(payload) == 2 and isinstance(payload[0], httpx._client.BaseClient)
+        if not is_http_request:
             response = yield payload
             continue
         # Create a default client is one is not explicitly requested
+        client, request = payload
         if client is None:
             client = httpx.Client()
         # Finally, we can actually execute the request
-        for attempt in retry_context():
-            with attempt:
-                response = handle_error(client.send(request))
+        try:
+            for attempt in retry_context():
+                with attempt:
+                    response = handle_error(client.send(request))
+        except Exception as exc:
+            requestor.throw(exc)
 
 
 async def send_requests_async[T](requestor: Generator[tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T]) -> T:
@@ -201,9 +206,13 @@ async def send_requests_async[T](requestor: Generator[tuple[httpx.AsyncClient | 
         # Create a default client is one is not explicitly requested
         if client is None:
             client = httpx.AsyncClient()
-        for attempt in retry_context():
-            with attempt:
-                response = handle_error(await client.send(request))
+        # Finally, we can actually execute the request
+        try:
+            for attempt in retry_context():
+                with attempt:
+                    response = handle_error(await client.send(request))
+        except Exception as exc:
+            requestor.throw(exc)
 
 
 
@@ -215,20 +224,49 @@ async def send_requests_generator_async[T](requestor: Generator[tuple[httpx.Asyn
             payload = requestor.send(response)
         except StopIteration as exc:
             return
-        # Check if it should be passed through (not an HTTP request)
-        if len(payload) != 2:
-            response = yield payload
-            continue
-        client, request = payload
-        if not isinstance(client, httpx._client.BaseClient):
+        # Check if yielded item should be passed through (not an HTTP request)
+        is_http_request = len(payload) == 2 and isinstance(payload[0], httpx._client.BaseClient)
+        if not is_http_request:
             response = yield payload
             continue
         # Create a default client is one is not explicitly requested
+        client, request = payload
         if client is None:
             client = httpx.AsyncClient()
-        for attempt in retry_context():
-            with attempt:
-                response = handle_error(await client.send(request))
+        # Finally, we can actually execute the request
+        try:
+            for attempt in retry_context():
+                with attempt:
+                    response = handle_error(await client.send(request))
+        except Exception as exc:
+            requestor.throw(exc)
+
+
+def requestor(generator: bool=False) -> Callable:
+    """A decorator that serves requests on behalf of the decorated generator function.
+
+    The wrapped function is expected to yield tuples of `(client,
+    request)`, such that ``client.send(request)`` will produce an
+    ``httpx.Response``. The wrapped function can also yield other
+    things; with ``generator=True`` the resulting function will be a
+    generator that yields anything that does not match the above
+    pattern.
+
+    Parameters
+    ==========
+
+    """
+    def decorator[T](func: T) -> T:
+
+        @functools.wraps(func)
+        def inner(self, *args, **kwargs):
+            sender = self.context.send_requests_generator if generator else self.context.send_requests
+            return sender(func(self, *args, **kwargs))
+
+        return inner
+
+    return decorator
+    
 
 
 class Context:
@@ -346,6 +384,7 @@ class Context:
         self._cache = cache
         self._token_cache = Path(TILED_CACHE_DIR / "tokens")
         self._api_key = api_key  # Stash it for use during `connect()`
+        self._awaitable = awaitable
 
         # Decide how we will we resolve HTTP requests
         self.send_requests = send_requests_async if awaitable else send_requests
@@ -434,7 +473,7 @@ class Context:
             self._token_cache,
             self.server_info,
             self.cache,
-            self.awaitable,
+            self._awaitable,
         )
 
     def __setstate__(self, state):
@@ -478,6 +517,7 @@ class Context:
         self._cache = cache
         self._verify = verify
         self.server_info = server_info
+        self._awaitable = awaitable
 
     @classmethod
     def from_any_uri(

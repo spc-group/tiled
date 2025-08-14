@@ -620,7 +620,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         """
         return self.new_variation(sorting=sorting)
 
-    def export(self, filepath, fields=None, *, format=None):
+    def _request_export(self, filepath, fields=None, *, format=None):
         """
         Download metadata and data below this node in some format and write to a file.
 
@@ -646,13 +646,17 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         params = {}
         if fields is not None:
             params["field"] = fields
-        return export_util(
+        return (yield from export_util(
             filepath,
             format,
-            self.context.http_client.get,
+            self.context.build_request,
             self.item["links"]["full"],
             params=params,
-        )
+        ))
+
+    @functools.wraps(_request_export)
+    def export(self, *args, **kwargs):
+        return self.context.send_requests(self._request_export(*args, **kwargs))
 
     def _ipython_key_completions_(self):
         """
@@ -1373,7 +1377,7 @@ DEFAULT_STRUCTURE_CLIENT_DISPATCH = {
         {
             "container": _Wrap(AsyncContainer),
             "composite": _LazyLoad(("..composite", Container.__module__), "Composite"),
-            "array": _LazyLoad(("..array", Container.__module__), "ArrayClient"),
+            "array": _LazyLoad(("..array", Container.__module__), "AsyncArrayClient"),
             "awkward": _LazyLoad(("..awkward", Container.__module__), "AwkwardClient"),
             "dataframe": _LazyLoad(
                 ("..dataframe", Container.__module__), "DataFrameClient"
@@ -1384,6 +1388,25 @@ DEFAULT_STRUCTURE_CLIENT_DISPATCH = {
             ),
             "xarray_dataset": _LazyLoad(
                 ("..xarray", Container.__module__), "DatasetClient"
+            ),
+        }
+    ),
+    "dask_async": OneShotCachedMap(
+        {
+            "container": _Wrap(AsyncContainer),
+            "composite": _LazyLoad(("..composite", Container.__module__), "Composite"),
+            "array": _LazyLoad(("..array", Container.__module__), "DaskAsyncArrayClient"),
+            # TODO Create DaskAwkwardClient
+            # "awkward": _LazyLoad(("..awkward", Container.__module__), "DaskAwkwardClient"),
+            "dataframe": _LazyLoad(
+                ("..dataframe", Container.__module__), "DaskDataFrameClient"
+            ),
+            "sparse": _LazyLoad(("..sparse", Container.__module__), "SparseClient"),
+            "table": _LazyLoad(
+                ("..dataframe", Container.__module__), "DaskDataFrameClient"
+            ),
+            "xarray_dataset": _LazyLoad(
+                ("..xarray", Container.__module__), "DaskDatasetClient"
             ),
         }
     ),
