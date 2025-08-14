@@ -8,11 +8,11 @@ import httpx
 
 from ..utils import import_object, prepend_to_sys_path
 from .container import DEFAULT_STRUCTURE_CLIENT_DISPATCH, Container
-from .context import DEFAULT_TIMEOUT_PARAMS, UNSET, Context, send_requests, send_requests_async
+from .context import DEFAULT_TIMEOUT_PARAMS, UNSET, Context, send_requests, send_requests_async, requestor
 from .utils import MSGPACK_MIME_TYPE, client_for_item, handle_error, retry_context
 
 
-def build_from_uri(
+def from_uri(
     uri,
     structure_clients="numpy",
     *,
@@ -100,7 +100,7 @@ For non-interactive authentication, use an API key.
     ))
 
 
-def build_from_context(
+def from_context(
     context: Context,
     structure_clients="numpy",
     node_path_parts=None,
@@ -147,28 +147,26 @@ def build_from_context(
             found_valid_tokens = remember_me and context.use_cached_tokens()
             if (not found_valid_tokens) and auth_is_required:
                 # Bundle the request with the context so other constructors have it
-                yield from ((context, request) for request in context.authenticate(remember_me=remember_me))
+                yield from context.authenticate(remember_me=remember_me)
     # Context ensures that context.api_uri has a trailing slash.
     item_uri = f"{context.api_uri}metadata/{'/'.join(node_path_parts)}"
     params = parse_qs(urlparse(item_uri).query)
     if include_data_sources:
         params["include_data_sources"] = include_data_sources
-    for attempt in retry_context():
-        with attempt:
-            request = context.http_client.build_request(
-                "GET",
-                item_uri,
-                headers={"Accept": MSGPACK_MIME_TYPE},
-            )
-            response = yield (context.http_client, request)
-            content = handle_error(response).json()
+    content = (
+        yield context.build_request(
+            "GET",
+            item_uri,
+            headers={"Accept": MSGPACK_MIME_TYPE},
+        )
+    ).json()
     item = content["data"]
     return client_for_item(
         context, structure_clients, item, include_data_sources=include_data_sources
     )
 
 
-def build_from_profile(name, structure_clients=None, **kwargs):
+def from_profile(name, structure_clients=None, **kwargs):
     """
     Build a Node based a 'profile' (a named configuration).
 
@@ -273,34 +271,18 @@ def build_from_profile(name, structure_clients=None, **kwargs):
         return (yield from build_from_uri(**merged))
 
 
+# Stash the builder functions, and replace them with decorated functions
+build_from_context = from_context
+build_from_uri = from_uri
+build_from_profile = from_profile
 
-@functools.wraps(build_from_context)
-def from_context(*args, **kwargs):
-    return send_requests(build_from_context(*args, **kwargs))
+from_context_async = functools.partial(from_context, awaitable=True)
+from_context_async = requestor(asynchronous=True)(from_context_async)
+from_uri_async = functools.partial(from_uri, awaitable=True)
+from_uri_async = requestor(asynchronous=True)(from_uri_async)
+from_profile_async = functools.partial(from_profile, awaitable=True)
+from_profile_async = requestor(asynchronous=True)(from_profile_async)
 
-
-@functools.wraps(build_from_uri)
-def from_uri(*args, **kwargs):
-    return send_requests(build_from_uri(*args, **kwargs))
-
-
-@functools.wraps(build_from_profile)
-def from_profile(*args, **kwargs):
-    return send_requests(build_from_profile(*args, **kwargs))
-
-
-@functools.wraps(build_from_context)
-async def from_context_async(*args, **kwargs):
-    return await send_requests_async(build_from_context(*args, **kwargs))
-
-
-@functools.wraps(build_from_uri)
-async def from_uri_async(*args, **kwargs):
-    kwargs.setdefault("awaitable", True)
-    return await send_requests_async(build_from_uri(*args, **kwargs))
-
-
-@functools.wraps(build_from_profile)
-async def from_profile_async(*args, **kwargs):
-    kwargs.setdefault("awaitable", True)
-    return await send_requests_async(build_from_profile(*args, **kwargs))
+from_context = requestor(asynchronous=False)(from_context)
+from_uri = requestor(asynchronous=False)(from_uri)
+from_profile = requestor(asynchronous=False)(from_profile)

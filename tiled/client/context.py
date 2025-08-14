@@ -242,7 +242,7 @@ async def send_requests_generator_async[T](requestor: Generator[tuple[httpx.Asyn
             requestor.throw(exc)
 
 
-def requestor(generator: bool=False) -> Callable:
+def requestor(generator: bool=False, asynchronous: bool | None = None) -> Callable:
     """A decorator that serves requests on behalf of the decorated generator function.
 
     The wrapped function is expected to yield tuples of `(client,
@@ -259,9 +259,28 @@ def requestor(generator: bool=False) -> Callable:
     def decorator[T](func: T) -> T:
 
         @functools.wraps(func)
-        def inner(self, *args, **kwargs):
-            sender = self.context.send_requests_generator if generator else self.context.send_requests
-            return sender(func(self, *args, **kwargs))
+        def inner(*args, **kwargs):
+            # match (asynchronous, generator, hasattr(args[0], "context")):
+            if asynchronous is None and not hasattr(args[0], "context"):
+                raise ValueError(
+                    "Either decorate a BaseClient method, or call "
+                    "repeater with the *asynchronous* parameters"
+                )
+            # Bound client methods
+            if asynchronous is None and generator:
+                sender = args[0].context.send_requests_generator
+            elif asynchronous is None and not generator:
+                sender = args[0].context.send_requests
+            # Unbound functions
+            elif not asynchronous and generator:
+                sender = send_requests_generator
+            elif asynchronous and generator:
+                sender = send_requests_async_generator
+            elif asynchronous:
+                sender = send_requests_async
+            else:
+                sender = send_requests
+            return sender(func(*args, **kwargs))
 
         return inner
 
@@ -396,21 +415,16 @@ class Context:
         # (2) Let the server set the CSRF cookie.
         # No authentication has been set up yet, so these requests will be unauthenticated.
         # https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#double-submit-cookie
-        for attempt in retry_context():
-            with attempt:
-                server_info = handle_error(
-                    (yield (
-                        self.http_client,
-                        self.http_client.build_request(
-                            "GET",
-                            self.api_uri,
-                            headers={
-                                "Accept": MSGPACK_MIME_TYPE,
-                                "Cache-Control": "no-cache, no-store",
-                            },
-                        )
-                    ))
-                ).json()
+        server_info = (
+            yield self.build_request(
+                "GET",
+                self.api_uri,
+                headers={
+                    "Accept": MSGPACK_MIME_TYPE,
+                    "Cache-Control": "no-cache, no-store",
+                },
+            )
+        ).json()
         self.server_info: About = TypeAdapter(About).validate_python(server_info)
         self.api_key = self._api_key  # property setter sets Authorization header
         self.admin = Admin(self)  # accessor for admin-related requests
@@ -789,7 +803,7 @@ class Context:
         """
         # Obtain tokens via OAuth2 unless the caller has passed them.
         providers = self.server_info.authentication.providers
-        tokens = prompt_for_credentials(
+        tokens = yield from prompt_for_credentials(
             self.http_client,
             providers,
         )
