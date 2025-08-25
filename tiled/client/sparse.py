@@ -7,6 +7,7 @@ from ndindex import ndindex
 from ..serialization.table import deserialize_arrow, serialize_arrow
 from ..utils import APACHE_ARROW_FILE_MIME_TYPE
 from .base import BaseClient
+from .context import requestor
 from .utils import export_util, handle_error, params_from_slice, retry_context
 
 
@@ -104,23 +105,21 @@ class SparseClient(BaseClient):
             shape=sliced_shape,
         )
 
+    @requestor()
     def write(self, coords, data):
         import pandas
 
         d = {f"dim{i}": coords for i, coords in enumerate(coords)}
         d["data"] = data
         df = pandas.DataFrame(d)
-        for attempt in retry_context():
-            with attempt:
-                handle_error(
-                    self.context.http_client.put(
-                        self.item["links"]["full"],
-                        content=bytes(
-                            serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, df, {})
-                        ),
-                        headers={"Content-Type": APACHE_ARROW_FILE_MIME_TYPE},
-                    )
-                )
+        yield self.context.build_request(
+            "PUT",
+            self.item["links"]["full"],
+            content=bytes(
+                serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, df, {})
+            ),
+            headers={"Content-Type": APACHE_ARROW_FILE_MIME_TYPE},
+        )
 
     def write_block(self, coords, data, block):
         import pandas

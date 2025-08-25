@@ -80,7 +80,8 @@ For non-interactive authentication, use an API key.
             "Tiled no longer accepts 'prompt_for_reauthentication' parameter. "
             + EXPLAIN_LOGIN
         )
-    context, node_path_parts = yield from Context.from_any_uri(
+    context, node_path_parts = yield from Context.from_any_uri.__wrapped__(
+        Context,
         uri,
         api_key=api_key,
         cache=cache,
@@ -147,7 +148,7 @@ def from_context(
             found_valid_tokens = remember_me and context.use_cached_tokens()
             if (not found_valid_tokens) and auth_is_required:
                 # Bundle the request with the context so other constructors have it
-                yield from context.authenticate(remember_me=remember_me)
+                yield from context.authenticate.__wrapped__(context, remember_me=remember_me)
     # Context ensures that context.api_uri has a trailing slash.
     item_uri = f"{context.api_uri}metadata/{'/'.join(node_path_parts)}"
     params = parse_qs(urlparse(item_uri).query)
@@ -262,10 +263,9 @@ def from_profile(name, structure_clients=None, **kwargs):
             raise ConfigError(
                 f"ValidationError while parsing configuration file {filepath}: {msg}"
             ) from err
-        context = Context.from_app(
-            build_app_from_config(config, source_filepath=filepath),
+        context = yield from Context.from_app.__wrapped__(
+            Context, build_app_from_config(config, source_filepath=filepath),
         )
-        yield from context.connect()
         return (yield from build_from_context(context, **merged))
     else:
         return (yield from build_from_uri(**merged))

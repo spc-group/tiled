@@ -1,3 +1,4 @@
+import dataclasses
 import functools
 import getpass
 import os
@@ -95,7 +96,7 @@ class PasswordRejected(RuntimeError):
     pass
 
 
-def prompt_for_credentials(http_client, providers: List[AboutAuthenticationProvider]):
+def prompt_for_credentials(context, providers: List[AboutAuthenticationProvider]):
     """
     Prompt for credentials or third-party login at an interactive terminal.
     """
@@ -115,29 +116,30 @@ def prompt_for_credentials(http_client, providers: List[AboutAuthenticationProvi
         PASSWORD_ATTEMPTS = 3
         for _attempt in range(PASSWORD_ATTEMPTS):
             password = password_input()
-            if not password:
-                raise PasswordRejected("Password empty.")
+            grantor = password_grant.__wrapped__(
+                context, auth_endpoint, provider, username, password
+            )            
             try:
-                tokens = yield from password_grant(
-                    http_client, auth_endpoint, provider, username, password
-                )
+                tokens = yield from grantor
             except httpx.HTTPStatusError as err:
                 if err.response.status_code == httpx.codes.UNAUTHORIZED:
                     print(
                         "Username or password not recognized. Retry, or press Enter to cancel."
                     )
+                    grantor.close()
                     continue
                 raise
             else:
-                # Success! We have tokens.
-                break
+                if tokens is not None:
+                    # Success! We have tokens.
+                    break
         else:
             # All attempts failed.
             raise PasswordRejected
     elif mode == "external":
         # Display link and access code, and try to open web browser.
         # Block while polling the server awaiting confirmation of authorization.
-        tokens = yield from device_code_grant(http_client, auth_endpoint)
+        tokens = yield from device_code_grant.__wrapped__(context, auth_endpoint)
     else:
         raise ValueError(f"Server has unknown authentication mechanism {mode!r}")
     confirmation_message = spec.confirmation_message
@@ -147,23 +149,34 @@ def prompt_for_credentials(http_client, providers: List[AboutAuthenticationProvi
     return tokens
 
 
-def send_requests[T](requestor: Generator[tuple[httpx.Client | None, httpx.Request], httpx.Response, T]) -> T:
+@dataclasses.dataclass(frozen=True)
+class TiledRequest:
+    client: httpx._client.BaseClient
+    request: httpx.Request
+    auth: httpx.Auth = httpx._client.UseClientDefault()
+    raw: bool = False
+
+
+def send_requests[T](requestor: Generator[TiledRequest, httpx.Response, T]) -> T:
     """Perform an HTTP request using *http_client* on behalf of *requestor*."""
     # Prime the generator
     response = None
     while True:
         try:
-            client, request = requestor.send(response)
+            request = requestor.send(response)
         except StopIteration as exc:
             return exc.value
-        # Create a default client is one is not explicitly requested
-        if client is None:
-            client = httpx.Client()
-        # Finally, we can actually execute the request
         try:
-            for attempt in retry_context():
-                with attempt:
-                    response = handle_error(client.send(request))
+            # Create a default client if one is not explicitly given
+            client = httpx.Client() if request.client is None else request.client
+            # Finally, we can actually execute the request    
+            if request.raw:
+                response = client.send(request.request, auth=request.auth)
+            else:
+                for attempt in retry_context():
+                    with attempt:
+                        response = handle_error(client.send(request.request, auth=request.auth))
+            assert response is not None
         except Exception as exc:
             requestor.throw(exc)
 
@@ -174,70 +187,73 @@ def send_requests_generator[T](requestor: Generator[tuple[httpx.Client | None, h
     response = None
     while True:
         try:
-            payload = requestor.send(response)
+            request = requestor.send(response)
         except StopIteration as exc:
             return exc.value
         # Check if yielded item should be passed through (not an HTTP request)
-        is_http_request = len(payload) == 2 and isinstance(payload[0], httpx._client.BaseClient)
-        if not is_http_request:
-            response = yield payload
+        if not isinstance(request, TiledRequest):
+            yield request
             continue
-        # Create a default client is one is not explicitly requested
-        client, request = payload
-        if client is None:
-            client = httpx.Client()
-        # Finally, we can actually execute the request
         try:
-            for attempt in retry_context():
-                with attempt:
-                    response = handle_error(client.send(request))
+            # Create a default client if one is not explicitly given
+            client = httpx.Client() if request.client is None else request.client
+            # Finally, we can actually execute the request    
+            if request.raw:
+                response = client.send(request.request, auth=request.auth)
+            else:
+                for attempt in retry_context():
+                    with attempt:
+                        response = handle_error(client.send(request.request, auth=request.auth))
         except Exception as exc:
             requestor.throw(exc)
 
 
 async def send_requests_async[T](requestor: Generator[tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T]) -> T:
     """Perform an HTTP request using an asynchronous *http_client* on behalf of *requestor*."""
+    # Prime the generator
     response = None
     while True:
         try:
-            client, request = requestor.send(response)
+            request = requestor.send(response)
         except StopIteration as exc:
             return exc.value
-        # Create a default client is one is not explicitly requested
-        if client is None:
-            client = httpx.AsyncClient()
-        # Finally, we can actually execute the request
         try:
-            for attempt in retry_context():
-                with attempt:
-                    response = handle_error(await client.send(request))
+            # Create a default client if one is not explicitly given
+            client = httpx.Client() if request.client is None else request.client
+            # Finally, we can actually execute the request    
+            if request.raw:
+                response = client.send(request.request, auth=request.auth)
+            else:
+                for attempt in retry_context():
+                    with attempt:
+                        response = handle_error(await client.send(request.request, auth=request.auth))
         except Exception as exc:
             requestor.throw(exc)
 
 
-
 async def send_requests_generator_async[T](requestor: Generator[tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T]) -> Generator[T, Any, None]:
     """Perform an HTTP request using an asynchronous *http_client* on behalf of *requestor*."""
+    # Prime the generator
     response = None
     while True:
         try:
-            payload = requestor.send(response)
+            request = requestor.send(response)
         except StopIteration as exc:
-            return
+            return  # Async generators can't return a value
         # Check if yielded item should be passed through (not an HTTP request)
-        is_http_request = len(payload) == 2 and isinstance(payload[0], httpx._client.BaseClient)
-        if not is_http_request:
-            response = yield payload
+        if not isinstance(request, TiledRequest):
+            yield request
             continue
-        # Create a default client is one is not explicitly requested
-        client, request = payload
-        if client is None:
-            client = httpx.AsyncClient()
-        # Finally, we can actually execute the request
         try:
-            for attempt in retry_context():
-                with attempt:
-                    response = handle_error(await client.send(request))
+            # Create a default client if one is not explicitly given
+            client = httpx.Client() if request.client is None else request.client
+            # Finally, we can actually execute the request    
+            if request.raw:
+                response = client.send(request.request, auth=request.auth)
+            else:
+                for attempt in retry_context():
+                    with attempt:
+                        response = handle_error(await client.send(request.request, auth=request.auth))
         except Exception as exc:
             requestor.throw(exc)
 
@@ -264,7 +280,8 @@ def requestor(generator: bool=False, asynchronous: bool | None = None) -> Callab
             if asynchronous is None and not hasattr(args[0], "context"):
                 raise ValueError(
                     "Either decorate a BaseClient method, or call "
-                    "repeater with the *asynchronous* parameters"
+                    "requestor() with the *asynchronous* parameters. "
+                    f"Got {args[0]}."
                 )
             # Bound client methods
             if asynchronous is None and generator:
@@ -306,6 +323,7 @@ class Context:
         raise_server_exceptions=True,
         awaitable=False,
     ):
+        self.context = self
         # The uri is expected to reach the root API route.
         uri = httpx.URL(uri)
         headers = headers or {}
@@ -358,7 +376,7 @@ class Context:
             cache = None
         if app is None:
             Client = httpx.AsyncClient if awaitable else httpx.Client
-            Trnsprt = AsyncTransport if awaitable else Transport
+            Trnsprt = sport if awaitable else Transport
             client = Client(
                 transport=Trnsprt(cache=cache),
                 verify=verify,
@@ -405,13 +423,13 @@ class Context:
         self._cache = cache
         self._token_cache = Path(TILED_CACHE_DIR / "tokens")
         self._api_key = api_key  # Stash it for use during `connect()`
-        self._awaitable = awaitable
+        self.is_awaitable = awaitable
 
         # Decide how we will we resolve HTTP requests
         self.send_requests = send_requests_async if awaitable else send_requests
         self.send_requests_generator = send_requests_generator_async if awaitable else send_requests_generator
 
-    def connect(self) -> Generator[httpx.Request, httpx.Response, None]:
+    def connect(self) -> Generator[TiledRequest, httpx.Response, None]:
         # Make an initial "safe" request to:
         # (1) Get the server_info.
         # (2) Let the server set the CSRF cookie.
@@ -431,13 +449,22 @@ class Context:
         self.api_key = self._api_key  # property setter sets Authorization header
         self.admin = Admin(self)  # accessor for admin-related requests
 
-    def build_request(self, method, url, *args, **kwargs):
+    def build_request(self, method, url, *args, auth=httpx._client.UseClientDefault(), raw=False, **kwargs):
         """Wrapper around httpx.Client.build_request suitable for yielding to
         `send_requests()`.
 
+        *raw* can be used to instruct `send_requests()` and cousins
+        that no retries or error handling should be performed; it is
+        the responsibility of the client code to perform these steps.
+
         """
         request = self.http_client.build_request(method, url, *args, **kwargs)
-        return (self.http_client, request)
+        return TiledRequest(
+            client=self.http_client,
+            request=request,
+            auth=auth,
+            raw=raw,
+        )
 
     def __repr__(self):
         auth_info = []
@@ -536,6 +563,7 @@ class Context:
         self._awaitable = awaitable
 
     @classmethod
+    @requestor(asynchronous=False)
     def from_any_uri(
         cls,
         uri,
@@ -561,9 +589,7 @@ class Context:
         # Logic will follow only one redirect, it is intended ONLY to toggle HTTPS.
         # The redirect will be followed only if the netloc host is identical to the original.
         if uri.scheme == "http":
-            for attempt in retry_context():
-                with attempt:
-                    response_from_http = yield (None, httpx.Request("GET", uri))
+            response_from_http = yield TiledRequest(None, httpx.Request("GET", uri))
             if response_from_http.is_redirect:
                 redirect_uri = httpx.URL(response_from_http.headers["location"])
                 if redirect_uri.scheme == "https" and redirect_uri.host == uri.host:
@@ -602,9 +628,11 @@ class Context:
             app=app,
             awaitable=awaitable,
         )
+        yield from context.connect()
         return context, node_path_parts
 
     @classmethod
+    @requestor(asynchronous=False)
     def from_app(
         cls,
         app,
@@ -628,6 +656,7 @@ class Context:
             app=app,
             raise_server_exceptions=raise_server_exceptions,
         )
+        yield from context.connect()
         if api_key is UNSET:
             if not context.server_info.authentication.providers:
                 # This is a single-user server.
@@ -688,6 +717,7 @@ class Context:
                     )
                 ).json()
 
+    @requestor()
     def create_api_key(self, scopes=None, expires_in=None, note=None, access_tags=None):
         """
         Generate a new API key.
@@ -713,20 +743,19 @@ class Context:
         """
         if isinstance(expires_in, str):
             expires_in = parse_time_string(expires_in)
-        for attempt in retry_context():
-            with attempt:
-                return handle_error(
-                    self.http_client.post(
-                        self.server_info.authentication.links.apikey,
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                        json={
-                            "scopes": scopes,
-                            "access_tags": access_tags,
-                            "expires_in": expires_in,
-                            "note": note,
-                        },
-                    )
-                ).json()
+        return (
+            yield self.build_request(
+                "POST",
+                self.server_info.authentication.links.apikey,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+                json={
+                    "scopes": scopes,
+                    "access_tags": access_tags,
+                    "expires_in": expires_in,
+                    "note": note
+                },
+            )
+        ).json()
 
     def revoke_api_key(self, first_eight):
         """
@@ -784,6 +813,7 @@ class Context:
         )
         return self.http_client.event_hooks
 
+    @requestor()
     def authenticate(
         self,
         *,
@@ -815,7 +845,7 @@ class Context:
         # Obtain tokens via OAuth2 unless the caller has passed them.
         providers = self.server_info.authentication.providers
         tokens = yield from prompt_for_credentials(
-            self.http_client,
+            self,
             providers,
         )
         self.configure_auth(tokens, remember_me=remember_me)
@@ -1165,24 +1195,20 @@ def _can_prompt():
     return False
 
 
-def password_grant(http_client, auth_endpoint, provider, username, password):
+@requestor()
+def password_grant(context, auth_endpoint, provider, username, password):
     form_data = {
         "grant_type": "password",
         "username": username,
         "password": password,
     }
-    for attempt in retry_context():
-        with attempt:
-            token_response = yield (http_client, http_client.build_request("POST", auth_endpoint, data=form_data, auth=None))
-            handle_error(token_response)
-    return token_response.json()
+    token_response = yield context.build_request("POST", auth_endpoint, data=form_data, auth=None)
+    return token_response.json() if token_response is not None else None
 
 
-def device_code_grant(http_client, auth_endpoint):
-    for attempt in retry_context():
-        with attempt:
-            verification_response = yield (http_client, http_client.build_request("POST", auth_endpoint, json={}, auth=None))
-            handle_error(verification_response)
+@requestor()
+def device_code_grant(context, auth_endpoint):
+    verification_response = yield context.build_request("POST", auth_endpoint, json={}, auth=None)
     verification = verification_response.json()
     authorization_uri = verification["authorization_uri"]
     print(
@@ -1210,14 +1236,16 @@ and enter the code:
             with attempt:
                 # Intentionally do not wrap this in handle_error(...).
                 # Check status codes manually below.
-                access_response = yield (http_client, http_client.build_request("POST",
+                access_response = yield context.build_request(
+                    "POST",
                     verification["verification_uri"],
                     json={
                         "device_code": verification["device_code"],
                         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                     },
                     auth=None,
-                ))
+                    raw=True,
+                )
                 if (access_response.status_code == httpx.codes.BAD_REQUEST) and (
                     access_response.json()["detail"]["error"] == "authorization_pending"
                 ):

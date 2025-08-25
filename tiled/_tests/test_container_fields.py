@@ -59,6 +59,7 @@ def excel_data_dir(tmpdir_factory):
 @pytest.mark.parametrize("client", ("excel_data_dir",), indirect=True)
 def test_excel_fields(client, fields, buffer):
     "Export selected fields (sheets) from an Excel file via /container/full."
+    print(list(client.keys()))
     client = client["spreadsheet"]
     url_path = client.item["links"]["full"]
     with record_history() as history:
