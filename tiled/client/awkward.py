@@ -3,6 +3,7 @@ import awkward
 from ..serialization.awkward import from_zipped_buffers, to_zipped_buffers
 from ..structures.awkward import project_form
 from .base import BaseClient
+from .context import requestor
 from .utils import export_util, handle_error, retry_context
 
 
@@ -35,20 +36,18 @@ class AwkwardClient(BaseClient):
 
         return f"<{type(self).__name__}>"
 
+    @requestor()
     def write(self, container):
         structure = self.structure()
         components = (structure.form, structure.length, container)
-        for attempt in retry_context():
-            with attempt:
-                handle_error(
-                    self.context.http_client.put(
-                        self.item["links"]["full"],
-                        content=bytes(
-                            to_zipped_buffers("application/zip", components, {})
-                        ),
-                        headers={"Content-Type": "application/zip"},
-                    )
-                )
+        yield self.context.build_request(
+            "PUT",
+            self.item["links"]["full"],
+            content=bytes(
+                to_zipped_buffers("application/zip", components, {})
+            ),
+            headers={"Content-Type": "application/zip"},
+        )
 
     def read(self, slice=...):
         structure = self.structure()
@@ -78,6 +77,7 @@ class AwkwardClient(BaseClient):
     def __getitem__(self, slice):
         return self.read(slice=slice)
 
+    @requestor()
     def export(self, filepath, *, format=None):
         """
         Download data in some format and write to a file.
@@ -103,10 +103,10 @@ class AwkwardClient(BaseClient):
         >>> a.export("awkward.json")
 
         """
-        return export_util(
+        return (yield from export_util(
             filepath,
             format,
-            self.context.http_client.get,
+            self.context.build_request,
             self.item["links"]["full"],
             params={},
-        )
+        ))

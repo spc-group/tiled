@@ -15,6 +15,7 @@ from tiled.client.context import Context
 from ..structures.core import STRUCTURE_TYPES, Spec, StructureFamily
 from ..structures.data_source import DataSource
 from ..utils import UNCHANGED, DictView, ListView, patch_mimetypes, safe_json_dump
+from .context import requestor
 from .metadata_update import apply_update_patch
 from .utils import MSGPACK_MIME_TYPE, handle_error, normalize_specs, retry_context
 
@@ -168,6 +169,7 @@ class BaseClient:
             )
         return self._structure
 
+    @requestor()
     def login(self):
         """
         Depending on the server's authentication method, this will prompt for username/password:
@@ -185,7 +187,7 @@ class BaseClient:
 
         and enter the code: XXXX-XXXX
         """
-        self.context.authenticate()
+        yield from self.context.authenticate.__wrapped__(self.context)
 
     def logout(self):
         """

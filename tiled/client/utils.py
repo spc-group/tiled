@@ -232,7 +232,7 @@ def export_util(file, format, build, link, params) -> Generator[httpx.Request, h
             # We have no filepath to infer to format from.
             raise ValueError("format must be specified when file is writeable buffer")
         content = (
-            yield from build(
+            yield build(
                 "GET",
                 link,
                 params={

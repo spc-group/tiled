@@ -677,6 +677,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             # Do not print messy traceback from thread. Just fail silently.
             return []
 
+    @requestor()
     def new(
         self,
         structure_family,
@@ -813,15 +814,17 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             Server-specific authZ tags in list form, used to confer access to the node.
 
         """
-        return self.new(
+        return (yield from self.new.__wrapped__(
+            self,
             StructureFamily.container,
             [],
             key=key,
             metadata=metadata,
             specs=specs,
             access_tags=access_tags,
-        )
+        ))
 
+    @requestor()
     def write_array(
         self,
         array,
@@ -887,7 +890,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             dims=dims,
             data_type=BuiltinDtype.from_numpy_dtype(array.dtype),
         )
-        client = self.new(
+        client = (yield from self.new.__wrapped__(
+            self,
             StructureFamily.array,
             [
                 DataSource(structure=structure, structure_family=StructureFamily.array),
@@ -896,10 +900,10 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             metadata=metadata,
             specs=specs,
             access_tags=access_tags,
-        )
+        ))
         chunked = any(len(dim) > 1 for dim in chunks)
         if not chunked:
-            client.write(array)
+            yield from client.write.__wrapped__(client, array)
         else:
             # Fan out client.write_block over each chunk using dask.
             if isinstance(array, dask.array.Array):
@@ -912,14 +916,16 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             # once, so we catch that call and become a no-op.
             def write_block(x, block_id, client):
                 if len(block_id):
-                    client.write_block(x, block=block_id)
+                    yield from client.write_block(x, block=block_id)
                 return x
 
             # TODO Is there a fire-and-forget analogue such that we don't need
             # to bother with the return type?
+            assert not self.context.is_awaitable, "Chunked writing in async is not supported yet."
             da.map_blocks(write_block, dtype=da.dtype, client=client).compute()
         return client
 
+    @requestor()
     def write_awkward(
         self,
         array,
@@ -959,7 +965,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             length=length,
             form=form.to_dict(),
         )
-        client = self.new(
+        client = yield from self.new.__wrapped__(
+            self,
             StructureFamily.awkward,
             [
                 DataSource(
@@ -971,9 +978,10 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             specs=specs,
             access_tags=access_tags,
         )
-        client.write(container)
+        yield from client.write.__wrapped__(client, container)
         return client
 
+    @requestor()
     def write_sparse(
         self,
         coords,
@@ -1040,7 +1048,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             data_type=BuiltinDtype.from_numpy_dtype(data.dtype),
             coord_data_type=BuiltinDtype.from_numpy_dtype(coords.dtype),
         )
-        client = self.new(
+        client = yield from self.new.__wrapped__(
+            self,
             StructureFamily.sparse,
             [
                 DataSource(
@@ -1052,9 +1061,10 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             specs=specs,
             access_tags=access_tags,
         )
-        client.write(coords, data)
+        yield from client.write.__wrapped__(client, coords, data)
         return client
 
+    @requestor()
     def create_appendable_table(
         self,
         schema: "pyarrow.Schema",
@@ -1099,7 +1109,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
 
         structure = TableStructure.from_schema(schema, npartitions)
 
-        client = self.new(
+        client = yield from self.new.__wrapped__(
+            self,
             StructureFamily.table,
             [
                 DataSource(
@@ -1117,6 +1128,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
 
         return client
 
+    @requestor()
     def write_dataframe(
         self,
         dataframe: Union["pandas.DataFrame", dict[str, Any]],
@@ -1158,7 +1170,8 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         else:
             structure = TableStructure.from_pandas(dataframe)
 
-        client = self.new(
+        client = yield from self.new.__wrapped__(
+            self,
             StructureFamily.table,
             [
                 DataSource(
@@ -1179,12 +1192,12 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                 raise NotImplementedError(
                     f"Unsure how to handle type {type(dataframe)}"
                 )
-
+            assert not self.context.awaitable, "Async writing partitions dataframes is not yet supported."
             ddf.map_partitions(
                 functools.partial(_write_partition, client=client), meta=dataframe._meta
             ).compute()
         else:
-            client.write(dataframe)
+            yield from client.write.__wrapped__(client, dataframe)
 
         return client
 
@@ -1314,7 +1327,7 @@ DEFAULT_STRUCTURE_CLIENT_DISPATCH = {
     "numpy_async": OneShotCachedMap(
         {
             "container": _Wrap(AsyncContainer),
-            "composite": _LazyLoad(("..composite", Container.__module__), "Composite"),
+            "composite": _LazyLoad(("..composite", Container.__module__), "AsyncComposite"),
             "array": _LazyLoad(("..array", Container.__module__), "AsyncArrayClient"),
             "awkward": _LazyLoad(("..awkward", Container.__module__), "AwkwardClient"),
             "dataframe": _LazyLoad(
@@ -1332,7 +1345,7 @@ DEFAULT_STRUCTURE_CLIENT_DISPATCH = {
     "dask_async": OneShotCachedMap(
         {
             "container": _Wrap(AsyncContainer),
-            "composite": _LazyLoad(("..composite", Container.__module__), "Composite"),
+            "composite": _LazyLoad(("..composite", Container.__module__), "AsyncComposite"),
             "array": _LazyLoad(("..array", Container.__module__), "DaskAsyncArrayClient"),
             # TODO Create DaskAwkwardClient
             # "awkward": _LazyLoad(("..awkward", Container.__module__), "DaskAwkwardClient"),

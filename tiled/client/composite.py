@@ -3,35 +3,36 @@ from typing import Iterable, Optional, Union
 from urllib.parse import parse_qs, urlparse
 
 from ..structures.core import StructureFamily
-from .container import LENGTH_CACHE_TTL, Container
-from .utils import MSGPACK_MIME_TYPE, handle_error, retry_context
+
+from .container import LENGTH_CACHE_TTL, Container, AsyncContainer
+from .context import requestor
+from .utils import MSGPACK_MIME_TYPE, client_for_item, handle_error, retry_context
 
 
-class CompositeClient(Container):
+class CompositeOverlay():
     def get_contents(self, maxlen=None, include_metadata=False):
         result = {}
         next_page_url = f"{self.item['links']['search']}"
         while (next_page_url is not None) or (
             maxlen is not None and len(result) < maxlen
         ):
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
-                            next_page_url,
-                            headers={"Accept": MSGPACK_MIME_TYPE},
-                            params={
-                                **parse_qs(urlparse(next_page_url).query),
-                                **self._queries_as_params,
-                            }
-                            | ({} if include_metadata else {"select_metadata": False})
-                            | (
-                                {}
+            content = (
+                yield self.context.build_request(
+                    "GET",
+                    next_page_url,
+                    headers={"Accept": MSGPACK_MIME_TYPE},
+                    params={
+                        **parse_qs(urlparse(next_page_url).query),
+                        **self._queries_as_params,
+                    }
+                    | ({} if include_metadata else {"select_metadata": False})
+                    | (
+                        {}
                                 if not self._include_data_sources
                                 else {"include_data_sources": True}
-                            ),
-                        )
-                    ).json()
+                    ),
+                )
+            ).json()
             result.update({item["id"]: item for item in content["data"]})
 
             next_page_url = content["links"]["next"]
@@ -41,7 +42,8 @@ class CompositeClient(Container):
     @property
     def _flat_keys_mapping(self):
         result = {}
-        for key, item in self.get_contents().items():
+        contents = yield from self.get_contents()
+        for key, item in contents.items():
             if item["attributes"]["structure_family"] == StructureFamily.table:
                 for col in item["attributes"]["structure"]["columns"]:
                     result[col] = item["id"] + "/" + col
@@ -59,15 +61,16 @@ class CompositeClient(Container):
             self.context, item=self.item, structure_clients=self.structure_clients
         )
 
+    @requestor(generator=True)
     def _keys_slice(self, start, stop, direction, _ignore_inlined_contents=False):
-        yield from self._flat_keys_mapping.keys()
+        flat_mapping = yield from self._flat_keys_mapping
+        yield from flat_mapping.keys()
 
+    @requestor(generator=True)
     def _items_slice(self, start, stop, direction, _ignore_inlined_contents=False):
-        for key in self._flat_keys_mapping.keys():
+        flat_mapping = yield from self._flat_keys_mapping
+        for key in flat_mapping.keys():
             yield key, self[key]
-
-    def __iter__(self):
-        yield from self._keys_slice(0, None, 1)
 
     def __len__(self):
         if self._cached_len is not None:
@@ -78,18 +81,20 @@ class CompositeClient(Container):
 
         return len(self._flat_keys_mapping)
 
+    @requestor()
     def __getitem__(self, key: str, _ignore_inlined_contents=False):
         if isinstance(key, tuple):
             key = "/".join(key)
-        if key in self._flat_keys_mapping:
-            key = self._flat_keys_mapping[key]
+        flat_mapping = yield from self._flat_keys_mapping
+        if key in flat_mapping:
+            key = flat_mapping[key]
         else:
             raise KeyError(
                 f"Key '{key}' not found. If it refers to a table, access it via "
                 f"the base Container client using `.base['{key}']` instead."
             )
 
-        return super().__getitem__(key, _ignore_inlined_contents)
+        return (yield from super().__getitem__.__wrapped__(self, key, _ignore_inlined_contents))
 
     def __contains__(self, key):
         return key in self._flat_keys_mapping.keys()
@@ -131,6 +136,7 @@ class CompositeClient(Container):
 
         return super().delete_contents(keys, external_only=external_only)
 
+    @requestor()
     def read(self, variables=None, dim0=None):
         """Download the contents of a composite node as an xarray.Dataset.
 
@@ -151,7 +157,8 @@ class CompositeClient(Container):
 
         array_dims = {}
         data_vars = {}
-        for part, item in self.get_contents().items():
+        contents = yield from self.get_contents()
+        for part, item in contents.items():
             # Read all or selective arrays/columns.
             if item["attributes"]["structure_family"] in {
                 StructureFamily.array,
@@ -177,7 +184,7 @@ class CompositeClient(Container):
                 columns = set(variables or table_client.columns).intersection(
                     table_client.columns
                 )
-                df = table_client.read(list(columns))
+                df = yield from table_client.read.__wrapped__(client, list(columns))
                 for column in columns:
                     data_vars[column] = df[column].values
                     # Convert (experimental) pandas.StringDtype to numpy's unicode string dtype
@@ -249,3 +256,16 @@ class CompositeClient(Container):
         return super().write_dataframe(
             dataframe, key=key, metadata=metadata, specs=specs, access_tags=access_tags
         )
+
+
+class Composite(CompositeOverlay, Container):
+
+    def __iter__(self):
+        yield from self._keys_slice(0, None, 1)
+
+
+class AsyncComposite(CompositeOverlay, AsyncContainer):
+
+    async def __aiter__(self):
+        async for key in self._keys_slice(0, None, 1):
+            yield key

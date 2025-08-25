@@ -245,7 +245,7 @@ class _DaskDataFrameClient(BaseClient):
     def append_partition(self, dataframe, partition):
         if partition > self.structure().npartitions:
             raise ValueError(f"Table has {self.structure().npartitions} partitions")
-        self.context.build_request(
+        yield self.context.build_request(
             "PATCH",
             self.item["links"]["partition"].format(index=partition),
             content=bytes(

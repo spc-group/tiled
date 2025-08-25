@@ -10,6 +10,7 @@ from ..structures.core import Spec
 from ..utils import APACHE_ARROW_FILE_MIME_TYPE
 from .base import BaseClient
 from .container import Container
+from .context import requestor
 from .utils import handle_error
 
 LENGTH_LIMIT_FOR_WIDE_TABLE_OPTIMIZATION = 1_000_000
@@ -37,14 +38,9 @@ class DaskDatasetClient(Container):
         coords = {}
         # Optimization: Download scalar columns in batch as DataFrame.
         # on first access.
-        coords_fetcher = _WideTableFetcher(
-            self.context.http_client,
-            self.item["links"]["full"],
-        )
-        data_vars_fetcher = _WideTableFetcher(
-            self.context.http_client,
-            self.item["links"]["full"],
-        )
+        Fetcher = _WideTableAsyncFetcher if self.context.is_awaitable else _WideTableFetcher
+        coords_fetcher = Fetcher(self.context, self.item["links"]["full"])
+        data_vars_fetcher = Fetcher(self.context, self.item["links"]["full"])
         array_clients = {}
         array_structures = {}
         first_dims = []
@@ -130,8 +126,8 @@ _EXTRA_CHARS_PER_ITEM = len("&field=")
 
 
 class _WideTableFetcher:
-    def __init__(self, http_client, link):
-        self.http_client = http_client
+    def __init__(self, context, link):
+        self.context = context
         self.link = link
         self.variables = []
         self._dataframe = None
@@ -151,6 +147,7 @@ class _WideTableFetcher:
             dtype=array_structure.data_type.to_numpy_dtype(),
         )
 
+    @requestor()
     def dataframe(self):
         with self._lock:
             if self._dataframe is None:
@@ -161,22 +158,23 @@ class _WideTableFetcher:
                     _EXTRA_CHARS_PER_ITEM + len(variable) for variable in self.variables
                 )
                 if url_length_for_get_request > BaseClient.URL_CHARACTER_LIMIT:
-                    dataframe = self._fetch_variables(self.variables, "POST")
+                    dataframe = (yield from self._fetch_variables(self.variables, "POST"))
                 else:
-                    dataframe = self._fetch_variables(self.variables, "GET")
+                    dataframe = (yield from self._fetch_variables(self.variables, "GET"))
                 self._dataframe = dataframe.reset_index()
         return self._dataframe
 
     def _fetch_variables(self, variables, method="GET"):
         if method == "GET":
-            return self._fetch_variables__get(variables)
+            return (yield from self._fetch_variables__get(variables))
         if method == "POST":
-            return self._fetch_variables__post(variables)
+            return (yield from self._fetch_variables__post(variables))
         raise NotImplementedError(f"Method {method} is not supported")
 
     def _fetch_variables__get(self, variables):
-        content = handle_error(
-            self.http_client.get(
+        content = (
+            yield self.context.build_request(
+                "GET",
                 self.link,
                 params={
                     **parse_qs(urlparse(self.link).query),
@@ -188,8 +186,9 @@ class _WideTableFetcher:
         return deserialize_arrow(content)
 
     def _fetch_variables__post(self, variables):
-        content = handle_error(
-            self.http_client.post(
+        content = (
+            yield self.context.build_request(
+                "POST",
                 self.link,
                 json=variables,
                 params={
@@ -199,6 +198,25 @@ class _WideTableFetcher:
             )
         ).read()
         return deserialize_arrow(content)
+
+
+class _WideTableAsyncFetcher(_WideTableFetcher):
+    async def dataframe(self):
+        with self._lock:
+            if self._dataframe is None:
+                # If self.variables contains many and/or lengthy names,
+                # we can bump into the URI size limit commonly imposed by
+                # HTTP stacks (e.g. nginx).
+                url_length_for_get_request = len(self.link) + sum(
+                    _EXTRA_CHARS_PER_ITEM + len(variable) for variable in self.variables
+                )
+                if url_length_for_get_request > BaseClient.URL_CHARACTER_LIMIT:
+                    dataframe = await self._fetch_variables(self.variables, "POST")
+                else:
+                    dataframe = await self._fetch_variables(self.variables, "GET")
+                self._dataframe = dataframe.reset_index()
+        return self._dataframe
+
 
 
 def write_xarray_dataset(client_node, dataset, key=None):
