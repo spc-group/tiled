@@ -7,11 +7,10 @@ import sys
 import time
 import urllib.parse
 import warnings
+from collections.abc import Callable, Generator
 from pathlib import Path
-from typing import List, Literal
+from typing import Any, List, Literal
 from urllib.parse import parse_qs, urlparse
-from collections.abc import Generator, Callable
-from typing import Any
 
 import httpx
 import platformdirs
@@ -23,7 +22,7 @@ from .._version import __version__ as tiled_version
 from ..utils import UNSET, DictView, parse_time_string
 from .auth import CannotRefreshAuthentication, TiledAuth, build_refresh_request
 from .decoders import SUPPORTED_DECODERS
-from .transport import Transport, AsyncTransport
+from .transport import AsyncTransport, Transport
 from .utils import (
     DEFAULT_TIMEOUT_PARAMS,
     MSGPACK_MIME_TYPE,
@@ -118,7 +117,7 @@ def prompt_for_credentials(context, providers: List[AboutAuthenticationProvider]
             password = password_input()
             grantor = password_grant.__wrapped__(
                 context, auth_endpoint, provider, username, password
-            )            
+            )
             try:
                 tokens = yield from grantor
             except httpx.HTTPStatusError as err:
@@ -169,19 +168,27 @@ def send_requests[T](requestor: Generator[TiledRequest, httpx.Response, T]) -> T
         try:
             # Create a default client if one is not explicitly given
             client = httpx.Client() if request.client is None else request.client
-            # Finally, we can actually execute the request    
+            # Finally, we can actually execute the request
             if request.raw:
                 response = client.send(request.request, auth=request.auth)
             else:
                 for attempt in retry_context():
                     with attempt:
-                        response = handle_error(client.send(request.request, auth=request.auth))
+                        response = handle_error(
+                            client.send(request.request, auth=request.auth)
+                        )
             assert response is not None
+        except AttributeError as exc:
+            requestor.throw(exc)
         except Exception as exc:
             requestor.throw(exc)
 
 
-def send_requests_generator[T](requestor: Generator[tuple[httpx.Client | None, httpx.Request], httpx.Response, T]) -> Generator[T, Any, None]:
+def send_requests_generator[
+    T
+](
+    requestor: Generator[tuple[httpx.Client | None, httpx.Request], httpx.Response, T]
+) -> Generator[T, Any, None]:
     """Perform an HTTP request using *http_client* on behalf of *requestor*."""
     # Prime the generator
     response = None
@@ -197,18 +204,26 @@ def send_requests_generator[T](requestor: Generator[tuple[httpx.Client | None, h
         try:
             # Create a default client if one is not explicitly given
             client = httpx.Client() if request.client is None else request.client
-            # Finally, we can actually execute the request    
+            # Finally, we can actually execute the request
             if request.raw:
                 response = client.send(request.request, auth=request.auth)
             else:
                 for attempt in retry_context():
                     with attempt:
-                        response = handle_error(client.send(request.request, auth=request.auth))
+                        response = handle_error(
+                            client.send(request.request, auth=request.auth)
+                        )
         except Exception as exc:
             requestor.throw(exc)
 
 
-async def send_requests_async[T](requestor: Generator[tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T]) -> T:
+async def send_requests_async[
+    T
+](
+    requestor: Generator[
+        tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T
+    ]
+) -> T:
     """Perform an HTTP request using an asynchronous *http_client* on behalf of *requestor*."""
     # Prime the generator
     response = None
@@ -220,25 +235,33 @@ async def send_requests_async[T](requestor: Generator[tuple[httpx.AsyncClient | 
         try:
             # Create a default client if one is not explicitly given
             client = httpx.Client() if request.client is None else request.client
-            # Finally, we can actually execute the request    
+            # Finally, we can actually execute the request
             if request.raw:
                 response = client.send(request.request, auth=request.auth)
             else:
                 for attempt in retry_context():
                     with attempt:
-                        response = handle_error(await client.send(request.request, auth=request.auth))
+                        response = handle_error(
+                            await client.send(request.request, auth=request.auth)
+                        )
         except Exception as exc:
             requestor.throw(exc)
 
 
-async def send_requests_generator_async[T](requestor: Generator[tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T]) -> Generator[T, Any, None]:
+async def send_requests_generator_async[
+    T
+](
+    requestor: Generator[
+        tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T
+    ]
+) -> Generator[T, Any, None]:
     """Perform an HTTP request using an asynchronous *http_client* on behalf of *requestor*."""
     # Prime the generator
     response = None
     while True:
         try:
             request = requestor.send(response)
-        except StopIteration as exc:
+        except StopIteration:
             return  # Async generators can't return a value
         # Check if yielded item should be passed through (not an HTTP request)
         if not isinstance(request, TiledRequest):
@@ -247,18 +270,20 @@ async def send_requests_generator_async[T](requestor: Generator[tuple[httpx.Asyn
         try:
             # Create a default client if one is not explicitly given
             client = httpx.Client() if request.client is None else request.client
-            # Finally, we can actually execute the request    
+            # Finally, we can actually execute the request
             if request.raw:
                 response = client.send(request.request, auth=request.auth)
             else:
                 for attempt in retry_context():
                     with attempt:
-                        response = handle_error(await client.send(request.request, auth=request.auth))
+                        response = handle_error(
+                            await client.send(request.request, auth=request.auth)
+                        )
         except Exception as exc:
             requestor.throw(exc)
 
 
-def requestor(generator: bool=False, asynchronous: bool | None = None) -> Callable:
+def requestor(generator: bool = False, asynchronous: bool | None = None) -> Callable:
     """A decorator that serves requests on behalf of the decorated generator function.
 
     The wrapped function is expected to yield tuples of `(client,
@@ -272,8 +297,8 @@ def requestor(generator: bool=False, asynchronous: bool | None = None) -> Callab
     ==========
 
     """
-    def decorator[T](func: T) -> T:
 
+    def decorator[T](func: T) -> T:
         @functools.wraps(func)
         def inner(*args, **kwargs):
             # match (asynchronous, generator, hasattr(args[0], "context")):
@@ -292,7 +317,7 @@ def requestor(generator: bool=False, asynchronous: bool | None = None) -> Callab
             elif not asynchronous and generator:
                 sender = send_requests_generator
             elif asynchronous and generator:
-                sender = send_requests_async_generator
+                sender = send_requests_generator_async
             elif asynchronous:
                 sender = send_requests_async
             else:
@@ -302,7 +327,6 @@ def requestor(generator: bool=False, asynchronous: bool | None = None) -> Callab
         return inner
 
     return decorator
-    
 
 
 class Context:
@@ -376,7 +400,7 @@ class Context:
             cache = None
         if app is None:
             Client = httpx.AsyncClient if awaitable else httpx.Client
-            Trnsprt = sport if awaitable else Transport
+            Trnsprt = AsyncTransport if awaitable else Transport
             client = Client(
                 transport=Trnsprt(cache=cache),
                 verify=verify,
@@ -427,7 +451,9 @@ class Context:
 
         # Decide how we will we resolve HTTP requests
         self.send_requests = send_requests_async if awaitable else send_requests
-        self.send_requests_generator = send_requests_generator_async if awaitable else send_requests_generator
+        self.send_requests_generator = (
+            send_requests_generator_async if awaitable else send_requests_generator
+        )
 
     def connect(self) -> Generator[TiledRequest, httpx.Response, None]:
         # Make an initial "safe" request to:
@@ -449,7 +475,15 @@ class Context:
         self.api_key = self._api_key  # property setter sets Authorization header
         self.admin = Admin(self)  # accessor for admin-related requests
 
-    def build_request(self, method, url, *args, auth=httpx._client.UseClientDefault(), raw=False, **kwargs):
+    def build_request(
+        self,
+        method,
+        url,
+        *args,
+        auth=httpx._client.UseClientDefault(),
+        raw=False,
+        **kwargs,
+    ):
         """Wrapper around httpx.Client.build_request suitable for yielding to
         `send_requests()`.
 
@@ -516,7 +550,7 @@ class Context:
             self._token_cache,
             self.server_info,
             self.cache,
-            self._awaitable,
+            self.is_awaitable,
         )
 
     def __setstate__(self, state):
@@ -560,7 +594,7 @@ class Context:
         self._cache = cache
         self._verify = verify
         self.server_info = server_info
-        self._awaitable = awaitable
+        self.is_awaitable = awaitable
 
     @classmethod
     @requestor(asynchronous=False)
@@ -574,7 +608,7 @@ class Context:
         timeout=None,
         verify=True,
         app=None,
-        awaitable: bool=False,
+        awaitable: bool = False,
     ):
         """
         Accept a URI to a specific node.
@@ -1202,13 +1236,17 @@ def password_grant(context, auth_endpoint, provider, username, password):
         "username": username,
         "password": password,
     }
-    token_response = yield context.build_request("POST", auth_endpoint, data=form_data, auth=None)
+    token_response = yield context.build_request(
+        "POST", auth_endpoint, data=form_data, auth=None
+    )
     return token_response.json() if token_response is not None else None
 
 
 @requestor()
 def device_code_grant(context, auth_endpoint):
-    verification_response = yield context.build_request("POST", auth_endpoint, json={}, auth=None)
+    verification_response = yield context.build_request(
+        "POST", auth_endpoint, json={}, auth=None
+    )
     verification = verification_response.json()
     authorization_uri = verification["authorization_uri"]
     print(

@@ -3,16 +3,15 @@ from typing import TYPE_CHECKING, Iterable, Optional, Union
 from urllib.parse import parse_qs, urlparse
 
 from ..structures.core import StructureFamily
-
-from .container import LENGTH_CACHE_TTL, Container, AsyncContainer
+from .container import LENGTH_CACHE_TTL, AsyncContainer, Container
 from .context import requestor
-from .utils import MSGPACK_MIME_TYPE, client_for_item, handle_error, retry_context
+from .utils import MSGPACK_MIME_TYPE
 
 if TYPE_CHECKING:
     import pyarrow
 
 
-class CompositeOverlay():
+class CompositeOverlay:
     def get_contents(self, maxlen=None, include_metadata=False):
         result = {}
         next_page_url = f"{self.item['links']['search']}"
@@ -31,8 +30,8 @@ class CompositeOverlay():
                     | ({} if include_metadata else {"select_metadata": False})
                     | (
                         {}
-                                if not self._include_data_sources
-                                else {"include_data_sources": True}
+                        if not self._include_data_sources
+                        else {"include_data_sources": True}
                     ),
                 )
             ).json()
@@ -67,7 +66,8 @@ class CompositeOverlay():
     @requestor(generator=True)
     def _keys_slice(self, start, stop, direction, _ignore_inlined_contents=False):
         flat_mapping = yield from self._flat_keys_mapping
-        yield from flat_mapping.keys()
+        for key in flat_mapping.keys():
+            yield key
 
     @requestor(generator=True)
     def _items_slice(self, start, stop, direction, _ignore_inlined_contents=False):
@@ -75,6 +75,7 @@ class CompositeOverlay():
         for key in flat_mapping.keys():
             yield key, self[key]
 
+    @requestor()
     def __len__(self):
         if self._cached_len is not None:
             length, deadline = self._cached_len
@@ -82,7 +83,7 @@ class CompositeOverlay():
                 # Used the cached value and do not make any request.
                 return length
 
-        return len(self._flat_keys_mapping)
+        return len((yield from self._flat_keys_mapping))
 
     @requestor()
     def __getitem__(self, key: str, _ignore_inlined_contents=False):
@@ -97,7 +98,11 @@ class CompositeOverlay():
                 f"the base Container client using `.base['{key}']` instead."
             )
 
-        return (yield from super().__getitem__.__wrapped__(self, key, _ignore_inlined_contents))
+        return (
+            yield from super().__getitem__.__wrapped__(
+                self, key, _ignore_inlined_contents
+            )
+        )
 
     def __contains__(self, key):
         return key in self._flat_keys_mapping.keys()
@@ -187,7 +192,8 @@ class CompositeOverlay():
                 columns = set(variables or table_client.columns).intersection(
                     table_client.columns
                 )
-                df = yield from table_client.read.__wrapped__(client, list(columns))
+                print(table_client.read)
+                df = table_client.read(list(columns))
                 for column in columns:
                     data_vars[column] = df[column].values
                     # Convert (experimental) pandas.StringDtype to numpy's unicode string dtype
@@ -227,6 +233,7 @@ class CompositeOverlay():
 
         return xarray.Dataset(data_vars=data_vars)
 
+    @requestor()
     def new(
         self,
         structure_family,
@@ -240,13 +247,16 @@ class CompositeOverlay():
         if key in self.keys():
             raise ValueError(f"Key '{key}' already exists in the composite node.")
 
-        return super().new(
-            structure_family,
-            data_sources,
-            key=key,
-            metadata=metadata,
-            specs=specs,
-            access_tags=access_tags,
+        return (
+            yield from super().new.__wrapped__(
+                self,
+                structure_family,
+                data_sources,
+                key=key,
+                metadata=metadata,
+                specs=specs,
+                access_tags=access_tags,
+            )
         )
 
     def write_table(
@@ -287,14 +297,12 @@ class CompositeOverlay():
         )
 
 
-class Composite(CompositeOverlay, Container):
-
+class CompositeClient(CompositeOverlay, Container):
     def __iter__(self):
         yield from self._keys_slice(0, None, 1)
 
 
-class AsyncComposite(CompositeOverlay, AsyncContainer):
-
+class AsyncCompositeClient(CompositeOverlay, AsyncContainer):
     async def __aiter__(self):
         async for key in self._keys_slice(0, None, 1):
             yield key

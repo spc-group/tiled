@@ -6,7 +6,7 @@ import itertools
 import time
 import warnings
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Any, Iterable, Optional, Union, Generator
+from typing import TYPE_CHECKING, Any, Generator, Iterable, Optional, Union
 from urllib.parse import parse_qs, urlparse
 
 import entrypoints
@@ -14,14 +14,21 @@ import httpx
 import orjson
 
 from ..adapters.utils import IndexersMixin
-from ..iterviews import ItemsView, KeysView, ValuesView, AsyncKeysView, AsyncItemsView, AsyncValuesView
+from ..iterviews import (
+    AsyncItemsView,
+    AsyncKeysView,
+    AsyncValuesView,
+    ItemsView,
+    KeysView,
+    ValuesView,
+)
 from ..queries import KeyLookup
 from ..query_registration import default_query_registry
 from ..structures.core import StructureFamily
 from ..structures.data_source import DataSource
 from ..utils import UNCHANGED, OneShotCachedMap, Sentinel, node_repr, safe_json_dump
 from .base import STRUCTURE_TYPES, BaseClient
-from .context import send_requests, send_requests_async, send_requests_generator, send_requests_generator_async, requestor
+from .context import requestor
 from .utils import (
     MSGPACK_MIME_TYPE,
     ClientError,
@@ -259,7 +266,9 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             next_page_url = content["links"]["next"]
 
     @requestor()
-    def __getitem__(self, keys, _ignore_inlined_contents=False) -> Generator[httpx.Request, httpx.Response, BaseClient]:
+    def __getitem__(
+        self, keys, _ignore_inlined_contents=False
+    ) -> Generator[httpx.Request, httpx.Response, BaseClient]:
         # These are equivalent:
         #
         # >>> node['a']['b']['c']
@@ -650,13 +659,15 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         params = {}
         if fields is not None:
             params["field"] = fields
-        return (yield from export_util(
-            filepath,
-            format,
-            self.context.build_request,
-            self.item["links"]["full"],
-            params=params,
-        ))
+        return (
+            yield from export_util(
+                filepath,
+                format,
+                self.context.build_request,
+                self.item["links"]["full"],
+                params=params,
+            )
+        )
 
     def _ipython_key_completions_(self):
         """
@@ -793,6 +804,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
     # to attempt to avoid bumping into size limits.
     _SUGGESTED_MAX_UPLOAD_SIZE = 100_000_000  # 100 MB
 
+    @requestor()
     def create_container(
         self,
         key=None,
@@ -817,15 +829,17 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             Server-specific authZ tags in list form, used to confer access to the node.
 
         """
-        return (yield from self.new.__wrapped__(
-            self,
-            StructureFamily.container,
-            [],
-            key=key,
-            metadata=metadata,
-            specs=specs,
-            access_tags=access_tags,
-        ))
+        return (
+            yield from self.new.__wrapped__(
+                self,
+                StructureFamily.container,
+                [],
+                key=key,
+                metadata=metadata,
+                specs=specs,
+                access_tags=access_tags,
+            )
+        )
 
     @requestor()
     def write_array(
@@ -893,7 +907,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             dims=dims,
             data_type=BuiltinDtype.from_numpy_dtype(array.dtype),
         )
-        client = (yield from self.new.__wrapped__(
+        client = yield from self.new.__wrapped__(
             self,
             StructureFamily.array,
             [
@@ -903,7 +917,7 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             metadata=metadata,
             specs=specs,
             access_tags=access_tags,
-        ))
+        )
         chunked = any(len(dim) > 1 for dim in chunks)
         if not chunked:
             yield from client.write.__wrapped__(client, array)
@@ -917,14 +931,17 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             # Dask inspects the signature and passes block_id in if present.
             # It also apparently calls it with an empty array and block_id
             # once, so we catch that call and become a no-op.
+            @requestor(asynchronous=False)
             def write_block(x, block_id, client):
                 if len(block_id):
-                    yield from client.write_block(x, block=block_id)
+                    yield from client.write_block.__wrapped__(x, block=block_id)
                 return x
 
             # TODO Is there a fire-and-forget analogue such that we don't need
             # to bother with the return type?
-            assert not self.context.is_awaitable, "Chunked writing in async is not supported yet."
+            assert (
+                not self.context.is_awaitable
+            ), "Chunked writing in async is not supported yet."
             da.map_blocks(write_block, dtype=da.dtype, client=client).compute()
         return client
 
@@ -1235,7 +1252,6 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
 
 
 class AsyncContainer(Container):
-
     def __repr__(self):
         return f"<AsyncContainer {self.uri}>"
 
@@ -1251,7 +1267,6 @@ class AsyncContainer(Container):
     async def __aiter__(self, _ignore_inlined_contents=False):
         async for item in self.__iter__(_ignore_inlined_contents):
             yield item
-
 
 
 def _queries_to_params(*queries):
@@ -1359,7 +1374,9 @@ DEFAULT_STRUCTURE_CLIENT_DISPATCH = {
     "numpy_async": OneShotCachedMap(
         {
             "container": _Wrap(AsyncContainer),
-            "composite": _LazyLoad(("..composite", Container.__module__), "AsyncComposite"),
+            "composite": _LazyLoad(
+                ("..composite", Container.__module__), "AsyncComposite"
+            ),
             "array": _LazyLoad(("..array", Container.__module__), "AsyncArrayClient"),
             "awkward": _LazyLoad(("..awkward", Container.__module__), "AwkwardClient"),
             "dataframe": _LazyLoad(
@@ -1377,8 +1394,12 @@ DEFAULT_STRUCTURE_CLIENT_DISPATCH = {
     "dask_async": OneShotCachedMap(
         {
             "container": _Wrap(AsyncContainer),
-            "composite": _LazyLoad(("..composite", Container.__module__), "AsyncComposite"),
-            "array": _LazyLoad(("..array", Container.__module__), "DaskAsyncArrayClient"),
+            "composite": _LazyLoad(
+                ("..composite", Container.__module__), "AsyncComposite"
+            ),
+            "array": _LazyLoad(
+                ("..array", Container.__module__), "DaskAsyncArrayClient"
+            ),
             # TODO Create DaskAwkwardClient
             # "awkward": _LazyLoad(("..awkward", Container.__module__), "DaskAwkwardClient"),
             "dataframe": _LazyLoad(

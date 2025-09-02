@@ -21,6 +21,7 @@ def test_pickle_context():
     except Exception:
         raise pytest.skip(f"Could not connect to {API_URL}")
     with Context(API_URL) as context:
+        context.send_requests(context.connect())
         pickle.loads(pickle.dumps(context))
 
 
@@ -32,6 +33,7 @@ def test_pickle_clients(structure_clients, tmpdir):
         raise pytest.skip(f"Could not connect to {API_URL}")
     cache = Cache(tmpdir / "http_response_cache.db")
     with Context(API_URL, cache=cache) as context:
+        context.send_requests(context.connect())
         if parse(context.server_info.library_version) < parse(MIN_VERSION):
             raise pytest.skip(
                 f"Server at {API_URL} is running too old a version to test against."
