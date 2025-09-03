@@ -7,11 +7,12 @@ import dask.array
 import httpx
 import numpy
 import pytest
+import pytest_asyncio
 from starlette.status import HTTP_400_BAD_REQUEST, HTTP_406_NOT_ACCEPTABLE
 
 from ..adapters.array import ArrayAdapter
 from ..adapters.mapping import MapAdapter
-from ..client import Context, from_context
+from ..client import Context, from_context, from_context_async
 from ..serialization.array import as_buffer
 from ..server.app import build_app
 from .utils import fail_with_status_code
@@ -97,12 +98,40 @@ def context():
         yield context
 
 
+@pytest_asyncio.fixture(scope="module")
+async def async_context():
+    tree = MapAdapter(
+        {
+            "array": array_tree,
+            "cube": cube_tree,
+            "inf": inf_tree,
+            "scalar": scalar_tree,
+            "zero": zero_tree,
+            "nested_arrays": nested_arrays_tree,
+        }
+    )
+    app = build_app(tree)
+    async with Context.from_app(app, awaitable=True) as context:
+        yield context
+
+
 @pytest.mark.parametrize("kind", list(array_cases))
 def test_array_dtypes(kind, context):
     client = from_context(context)["array"]
     expected = array_cases[kind]
     actual_via_slice = client[kind][:]
     actual_via_read = client[kind].read()
+    assert numpy.array_equal(actual_via_slice, actual_via_read)
+    assert numpy.array_equal(actual_via_slice, expected)
+
+
+@pytest.mark.parametrize("kind", list(array_cases))
+@pytest.mark.asyncio
+async def test_array_dtypes_async(kind, async_context):
+    client = await (await from_context_async(async_context))["array"]
+    expected = array_cases[kind]
+    actual_via_slice = await (await client[kind])[:]
+    actual_via_read = await (await client[kind]).read()
     assert numpy.array_equal(actual_via_slice, actual_via_read)
     assert numpy.array_equal(actual_via_slice, expected)
 
@@ -162,6 +191,16 @@ def test_dask(context):
     assert numpy.array_equal(client[:].compute(), expected)
 
 
+@pytest.mark.asyncio
+async def test_dask_async(async_context):
+    expected = cube_cases["tiny_cube"]
+    client = await from_context_async(async_context, "dask")
+    client = await (await client["cube"])["tiny_cube"]
+    assert numpy.array_equal(await client.read().compute(), expected)
+    assert numpy.array_equal(await client.compute(), expected)
+    assert numpy.array_equal(await client[:].compute(), expected)
+
+
 def test_array_format_shape_from_cube(context):
     client = from_context(context)["cube"]
     with fail_with_status_code(HTTP_406_NOT_ACCEPTABLE):
@@ -176,6 +215,22 @@ def test_array_interface(context):
         assert v.nbytes == array_cases[k].nbytes
         assert v.dtype == array_cases[k].dtype
         assert numpy.array_equal(numpy.asarray(v), array_cases[k])
+        # smoke test
+        v.chunks
+        v.dims
+
+
+@pytest.mark.asyncio
+async def test_array_interface_async(async_context):
+    client = await (await from_context_async(async_context))["array"]
+    async for k, v in client.items():
+        print(k, v)
+        assert v.shape == array_cases[k].shape
+        assert v.ndim == array_cases[k].ndim
+        assert v.nbytes == array_cases[k].nbytes
+        assert v.dtype == array_cases[k].dtype
+        with pytest.raises(ValueError):
+            assert numpy.array_equal(numpy.asarray(v), array_cases[k])
         # smoke test
         v.chunks
         v.dims

@@ -2,7 +2,6 @@ import itertools
 from collections.abc import Generator
 from typing import TYPE_CHECKING, Union
 from urllib.parse import parse_qs, urlparse
-import functools
 
 import dask
 import dask.array
@@ -12,14 +11,8 @@ from numpy.typing import NDArray
 
 from ..structures.core import STRUCTURE_TYPES
 from .base import BaseClient
-from .context import requestor
-from .utils import (
-    chunks_repr,
-    export_util,
-    handle_error,
-    params_from_slice,
-    retry_context,
-)
+from .context import TiledRequest, requestor
+from .utils import TiledResponse, chunks_repr, export_util, params_from_slice
 
 if TYPE_CHECKING:
     from .stream import Subscription
@@ -77,10 +70,14 @@ class _DaskArrayClient(BaseClient):
         )
 
     def __array__(self, *args, **kwargs):
+        if self.context.is_awaitable:
+            raise ValueError("Cannot use __array__ with asynchronous client. ")
         return self.read().__array__(*args, **kwargs)
 
     @requestor()
-    def _get_block(self, block, dtype, shape, slice=None):
+    def _get_block(
+        self, block, dtype, shape, slice=None
+    ) -> Generator[TiledRequest, TiledResponse, NDArray]:
         """
         Fetch the actual data for one block in a chunked (dask) array.
 
@@ -272,17 +269,18 @@ class _DaskArrayClient(BaseClient):
             "extend": bool(extend),
         }
         try:
-            response = (
-                yield from self.context.build_request(
-                    "PATCH",
-                    url_path,
-                    content=array_.tobytes(),
-                    headers={"Content-Type": "application/octet-stream"},
-                    params=params,
-                )
+            response = yield from self.context.build_request(
+                "PATCH",
+                url_path,
+                content=array_.tobytes(),
+                headers={"Content-Type": "application/octet-stream"},
+                params=params,
             )
         except httpx.StatusError as exc:
-            if hasattr(exc, "response") and exc.response.status_code == httpx.codes.CONFLICT:
+            if (
+                hasattr(exc, "response")
+                and exc.response.status_code == httpx.codes.CONFLICT
+            ):
                 exc = ValueError(
                     f"Slice {slice} does not fit within current array shape. "
                     "Pass keyword argument extend=True to extend the array "
@@ -305,7 +303,9 @@ class _DaskArrayClient(BaseClient):
         return self.structure().shape[0]
 
     @requestor()
-    def export(self, filepath, *, format=None, slice=None, link=None, template_vars=None):
+    def export(
+        self, filepath, *, format=None, slice=None, link=None, template_vars=None
+    ):
         """
         Download data in some format and write to a file.
 
@@ -343,13 +343,15 @@ class _DaskArrayClient(BaseClient):
             link = "full"
         template_vars = template_vars or {}
         params = params_from_slice(slice)
-        return (yield from export_util(
-            filepath,
-            format,
-            self.context.build_request,
-            self.item["links"][link].format(**template_vars),
-            params=params,
-        ))
+        return (
+            yield from export_util(
+                filepath,
+                format,
+                self.context.build_request,
+                self.item["links"][link].format(**template_vars),
+                params=params,
+            )
+        )
 
     def subscribe(self) -> "Subscription":
         """
@@ -432,4 +434,3 @@ class AsyncArrayClient(DaskArrayClient):
         Optionally, access only a slice *within* this block.
         """
         return await super().read_block(block, slice).compute()
-    

@@ -10,8 +10,7 @@ from ..structures.core import Spec
 from ..utils import APACHE_ARROW_FILE_MIME_TYPE
 from .base import BaseClient
 from .container import Container
-from .context import requestor
-from .utils import handle_error
+from .context import TiledRequest, requestor
 
 LENGTH_LIMIT_FOR_WIDE_TABLE_OPTIMIZATION = 1_000_000
 
@@ -38,13 +37,19 @@ class DaskDatasetClient(Container):
         coords = {}
         # Optimization: Download scalar columns in batch as DataFrame.
         # on first access.
-        Fetcher = _WideTableAsyncFetcher if self.context.is_awaitable else _WideTableFetcher
+        Fetcher = (
+            _WideTableAsyncFetcher if self.context.is_awaitable else _WideTableFetcher
+        )
         coords_fetcher = Fetcher(self.context, self.item["links"]["full"])
         data_vars_fetcher = Fetcher(self.context, self.item["links"]["full"])
         array_clients = {}
         array_structures = {}
         first_dims = []
-        for name, array_client in self.items():
+        for maybe_client in self._items_slice.__wrapped__(self, 0, None, 1):
+            if isinstance(maybe_client, TiledRequest):
+                yield maybe_client
+            else:
+                name, array_client = maybe_client
             if (variables is not None) and (name not in variables):
                 continue
             array_clients[name] = array_client
@@ -90,13 +95,13 @@ class DaskDatasetClient(Container):
                 if "xarray_coord" in spec_names:
                     coords[name] = (
                         array_client.dims,
-                        array_client.read(),
+                        array_client.read.__wrapped__(self),
                         array_client.metadata["attrs"],
                     )
                 elif "xarray_data_var" in spec_names:
                     data_vars[name] = (
                         array_client.dims,
-                        array_client.read(),
+                        array_client.read.__wrapped__(self),
                         array_client.metadata["attrs"],
                     )
                 else:
@@ -106,8 +111,11 @@ class DaskDatasetClient(Container):
                     )
         return data_vars, coords
 
+    @requestor()
     def read(self, variables=None, *, optimize_wide_table=True):
-        data_vars, coords = self._build_arrays(variables, optimize_wide_table)
+        data_vars, coords = yield from self._build_arrays(
+            variables, optimize_wide_table
+        )
         return xarray.Dataset(
             data_vars=data_vars, coords=coords, attrs=self.metadata["attrs"]
         )
@@ -120,6 +128,11 @@ class DatasetClient(DaskDatasetClient):
             .read(variables=variables, optimize_wide_table=optimize_wide_table)
             .load()
         )
+
+
+class AsyncDatasetClient(DaskDatasetClient):
+    def __repr__(self):
+        return f"<AsyncDatasetClient {self.uri}>"
 
 
 _EXTRA_CHARS_PER_ITEM = len("&field=")
@@ -158,9 +171,9 @@ class _WideTableFetcher:
                     _EXTRA_CHARS_PER_ITEM + len(variable) for variable in self.variables
                 )
                 if url_length_for_get_request > BaseClient.URL_CHARACTER_LIMIT:
-                    dataframe = (yield from self._fetch_variables(self.variables, "POST"))
+                    dataframe = yield from self._fetch_variables(self.variables, "POST")
                 else:
-                    dataframe = (yield from self._fetch_variables(self.variables, "GET"))
+                    dataframe = yield from self._fetch_variables(self.variables, "GET")
                 self._dataframe = dataframe.reset_index()
         return self._dataframe
 
@@ -216,7 +229,6 @@ class _WideTableAsyncFetcher(_WideTableFetcher):
                     dataframe = await self._fetch_variables(self.variables, "GET")
                 self._dataframe = dataframe.reset_index()
         return self._dataframe
-
 
 
 def write_xarray_dataset(client_node, dataset, key=None):

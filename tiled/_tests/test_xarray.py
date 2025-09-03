@@ -3,12 +3,13 @@ import numpy
 import orjson
 import pandas
 import pytest
+import pytest_asyncio
 import xarray
 import xarray.testing
 
 from ..adapters.mapping import MapAdapter
 from ..adapters.xarray import DatasetAdapter
-from ..client import Context, from_context, record_history
+from ..client import Context, from_context, from_context_async, record_history
 from ..serialization.xarray import serialize_json
 from ..server.app import build_app
 from ..structures.core import Spec
@@ -67,6 +68,14 @@ tree = MapAdapter(
 )
 
 
+@pytest_asyncio.fixture(scope="module")
+async def async_client():
+    app = build_app(tree)
+    async with (await Context.from_app_async(app, awaitable=True)) as context:
+        client = await from_context_async(context)
+        yield client
+
+
 @pytest.fixture(scope="module")
 def client():
     app = build_app(tree)
@@ -79,6 +88,17 @@ def client():
 def test_xarray_dataset(client, key):
     expected = EXPECTED[key]
     actual = client[key].read().load()
+    xarray.testing.assert_identical(actual, expected)
+
+
+@pytest.mark.parametrize("key", list(tree))
+@pytest.mark.asyncio
+async def test_xarray_dataset_async(async_client, key):
+    client = async_client
+    expected = EXPECTED[key]
+    xarr = await (await client[key]).read()
+    print(xarr)
+    actual = (().read()).load()
     xarray.testing.assert_identical(actual, expected)
 
 

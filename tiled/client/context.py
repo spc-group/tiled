@@ -156,133 +156,6 @@ class TiledRequest:
     raw: bool = False
 
 
-def send_requests[T](requestor: Generator[TiledRequest, httpx.Response, T]) -> T:
-    """Perform an HTTP request using *http_client* on behalf of *requestor*."""
-    # Prime the generator
-    response = None
-    while True:
-        try:
-            request = requestor.send(response)
-        except StopIteration as exc:
-            return exc.value
-        try:
-            # Create a default client if one is not explicitly given
-            client = httpx.Client() if request.client is None else request.client
-            # Finally, we can actually execute the request
-            if request.raw:
-                response = client.send(request.request, auth=request.auth)
-            else:
-                for attempt in retry_context():
-                    with attempt:
-                        response = handle_error(
-                            client.send(request.request, auth=request.auth)
-                        )
-            assert response is not None
-        except AttributeError as exc:
-            requestor.throw(exc)
-        except Exception as exc:
-            requestor.throw(exc)
-
-
-def send_requests_generator[
-    T
-](
-    requestor: Generator[tuple[httpx.Client | None, httpx.Request], httpx.Response, T]
-) -> Generator[T, Any, None]:
-    """Perform an HTTP request using *http_client* on behalf of *requestor*."""
-    # Prime the generator
-    response = None
-    while True:
-        try:
-            request = requestor.send(response)
-        except StopIteration as exc:
-            return exc.value
-        # Check if yielded item should be passed through (not an HTTP request)
-        if not isinstance(request, TiledRequest):
-            yield request
-            continue
-        try:
-            # Create a default client if one is not explicitly given
-            client = httpx.Client() if request.client is None else request.client
-            # Finally, we can actually execute the request
-            if request.raw:
-                response = client.send(request.request, auth=request.auth)
-            else:
-                for attempt in retry_context():
-                    with attempt:
-                        response = handle_error(
-                            client.send(request.request, auth=request.auth)
-                        )
-        except Exception as exc:
-            requestor.throw(exc)
-
-
-async def send_requests_async[
-    T
-](
-    requestor: Generator[
-        tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T
-    ]
-) -> T:
-    """Perform an HTTP request using an asynchronous *http_client* on behalf of *requestor*."""
-    # Prime the generator
-    response = None
-    while True:
-        try:
-            request = requestor.send(response)
-        except StopIteration as exc:
-            return exc.value
-        try:
-            # Create a default client if one is not explicitly given
-            client = httpx.Client() if request.client is None else request.client
-            # Finally, we can actually execute the request
-            if request.raw:
-                response = client.send(request.request, auth=request.auth)
-            else:
-                for attempt in retry_context():
-                    with attempt:
-                        response = handle_error(
-                            await client.send(request.request, auth=request.auth)
-                        )
-        except Exception as exc:
-            requestor.throw(exc)
-
-
-async def send_requests_generator_async[
-    T
-](
-    requestor: Generator[
-        tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T
-    ]
-) -> Generator[T, Any, None]:
-    """Perform an HTTP request using an asynchronous *http_client* on behalf of *requestor*."""
-    # Prime the generator
-    response = None
-    while True:
-        try:
-            request = requestor.send(response)
-        except StopIteration:
-            return  # Async generators can't return a value
-        # Check if yielded item should be passed through (not an HTTP request)
-        if not isinstance(request, TiledRequest):
-            yield request
-            continue
-        try:
-            # Create a default client if one is not explicitly given
-            client = httpx.Client() if request.client is None else request.client
-            # Finally, we can actually execute the request
-            if request.raw:
-                response = client.send(request.request, auth=request.auth)
-            else:
-                for attempt in retry_context():
-                    with attempt:
-                        response = handle_error(
-                            await client.send(request.request, auth=request.auth)
-                        )
-        except Exception as exc:
-            requestor.throw(exc)
-
-
 def requestor(generator: bool = False, asynchronous: bool | None = None) -> Callable:
     """A decorator that serves requests on behalf of the decorated generator function.
 
@@ -302,12 +175,14 @@ def requestor(generator: bool = False, asynchronous: bool | None = None) -> Call
         @functools.wraps(func)
         def inner(*args, **kwargs):
             # match (asynchronous, generator, hasattr(args[0], "context")):
-            if asynchronous is None and not hasattr(args[0], "context"):
-                raise ValueError(
-                    "Either decorate a BaseClient method, or call "
-                    "requestor() with the *asynchronous* parameters. "
-                    f"Got {args[0]}."
-                )
+            if asynchronous is None:
+                context = _find_context(args[0])
+                if context is None:
+                    raise ValueError(
+                        "Either decorate a BaseClient method, or call "
+                        "requestor() with the *asynchronous* parameters. "
+                        f"Got {args[0]}."
+                    )
             # Bound client methods
             if asynchronous is None and generator:
                 sender = args[0].context.send_requests_generator
@@ -399,16 +274,24 @@ class Context:
         if cache is UNSET:
             cache = None
         if app is None:
+            ATransport = AsyncTransport if awaitable else Transport
             Client = httpx.AsyncClient if awaitable else httpx.Client
-            Trnsprt = AsyncTransport if awaitable else Transport
             client = Client(
-                transport=Trnsprt(cache=cache),
+                transport=ATransport(cache=cache),
                 verify=verify,
                 timeout=timeout,
                 follow_redirects=True,
             )
             # Do this in the setter to avoid being overwritten.
             client.headers = headers
+        elif awaitable:
+            # https://tekmusings.com/why-starlette-test-client-breaks-your-pytest-asyncio-tests.html
+            client = httpx.AsyncClient(
+                transport=AsyncTransport(transport=httpx.ASGITransport(app)),
+                verify=False,
+                follow_redirects=True,
+            )
+            client.app = app
         else:
             # Set up an ASGI client.
             # Because we have been handed an app, we can infer that
@@ -447,9 +330,9 @@ class Context:
         self._cache = cache
         self._token_cache = Path(TILED_CACHE_DIR / "tokens")
         self._api_key = api_key  # Stash it for use during `connect()`
-        self.is_awaitable = awaitable
 
         # Decide how we will we resolve HTTP requests
+        self.is_awaitable = awaitable
         self.send_requests = send_requests_async if awaitable else send_requests
         self.send_requests_generator = (
             send_requests_generator_async if awaitable else send_requests_generator
@@ -461,17 +344,28 @@ class Context:
         # (2) Let the server set the CSRF cookie.
         # No authentication has been set up yet, so these requests will be unauthenticated.
         # https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#double-submit-cookie
-        server_info = (
-            yield self.build_request(
-                "GET",
-                self.api_uri,
-                headers={
-                    "Accept": MSGPACK_MIME_TYPE,
-                    "Cache-Control": "no-cache, no-store",
-                },
-            )
-        ).json()
+        server_info = yield self.build_request(
+            "GET",
+            self.api_uri,
+            headers={
+                "Accept": MSGPACK_MIME_TYPE,
+                "Cache-Control": "no-cache, no-store",
+            },
+        )
+        server_info = server_info.json()
         self.server_info: About = TypeAdapter(About).validate_python(server_info)
+        if self._api_key is UNSET:
+            if not self.server_info.authentication.providers:
+                # This is a single-user server.
+                # Extract the API key from the app and set it.
+                from ..server.settings import get_settings
+
+                settings = self.http_client.app.dependency_overrides[get_settings]()
+                self._api_key = settings.single_user_api_key or None
+            else:
+                # This is a multi-user server but no API key was passed,
+                # so we will leave it as None on the Context.
+                self._api_key = None
         self.api_key = self._api_key  # property setter sets Authorization header
         self.admin = Admin(self)  # accessor for admin-related requests
 
@@ -524,14 +418,27 @@ class Context:
         auth_repr = " ".join(auth_info)
         return f"<{type(self).__name__} {auth_repr}>"
 
+    @requestor(asynchronous=False)
     def __enter__(self):
+        yield from self.connect()
+        return self
+
+    @requestor(asynchronous=True)
+    def __aenter__(self):
+        yield from self.connect()
         return self
 
     def __exit__(self, *args):
         self.close()
 
+    async def __aexit__(self, *args):
+        await self.aclose()
+
     def close(self):
         self.http_client.__exit__()
+
+    async def aclose(self):
+        await self.http_client.__aexit__()
 
     def __getstate__(self):
         if getattr(self.http_client, "app", None):
@@ -596,8 +503,8 @@ class Context:
         self.server_info = server_info
         self.is_awaitable = awaitable
 
-    @classmethod
     @requestor(asynchronous=False)
+    @classmethod
     def from_any_uri(
         cls,
         uri,
@@ -662,11 +569,9 @@ class Context:
             app=app,
             awaitable=awaitable,
         )
-        yield from context.connect()
         return context, node_path_parts
 
     @classmethod
-    @requestor(asynchronous=False)
     def from_app(
         cls,
         app,
@@ -677,6 +582,7 @@ class Context:
         api_key=UNSET,
         raise_server_exceptions=True,
         uri=None,
+        awaitable=False,
     ):
         """
         Construct a Context around a FastAPI app. Primarily for testing.
@@ -689,21 +595,9 @@ class Context:
             timeout=timeout,
             app=app,
             raise_server_exceptions=raise_server_exceptions,
+            awaitable=awaitable,
         )
-        yield from context.connect()
-        if api_key is UNSET:
-            if not context.server_info.authentication.providers:
-                # This is a single-user server.
-                # Extract the API key from the app and set it.
-                from ..server.settings import get_settings
-
-                settings = app.dependency_overrides[get_settings]()
-                api_key = settings.single_user_api_key or None
-            else:
-                # This is a multi-user server but no API key was passed,
-                # so we will leave it as None on the Context.
-                api_key = None
-        context.api_key = api_key
+        context._api_key = api_key
         return context
 
     @property
@@ -1294,3 +1188,141 @@ and enter the code:
         break
     tokens = access_response.json()
     return tokens
+
+
+def send_requests[T](requestor: Generator[TiledRequest, httpx.Response, T]) -> T:
+    """Perform an HTTP request using *http_client* on behalf of *requestor*."""
+    # Prime the generator
+    response = None
+    while True:
+        try:
+            request = requestor.send(response)
+        except StopIteration as exc:
+            return exc.value
+        try:
+            # Create a default client if one is not explicitly given
+            client = httpx.Client() if request.client is None else request.client
+            # Finally, we can actually execute the request
+            if request.raw:
+                response = client.send(request.request, auth=request.auth)
+            else:
+                for attempt in retry_context():
+                    with attempt:
+                        response = handle_error(
+                            client.send(request.request, auth=request.auth)
+                        )
+            assert response is not None
+        except AttributeError as exc:
+            requestor.throw(exc)
+        except Exception as exc:
+            requestor.throw(exc)
+
+
+def send_requests_generator[
+    T
+](
+    requestor: Generator[tuple[httpx.Client | None, httpx.Request], httpx.Response, T]
+) -> Generator[T, Any, None]:
+    """Perform an HTTP request using *http_client* on behalf of *requestor*."""
+    # Prime the generator
+    response = None
+    while True:
+        try:
+            request = requestor.send(response)
+        except StopIteration as exc:
+            return exc.value
+        # Check if yielded item should be passed through (not an HTTP request)
+        if not isinstance(request, TiledRequest):
+            yield request
+            continue
+        try:
+            # Create a default client if one is not explicitly given
+            client = httpx.Client() if request.client is None else request.client
+            # Finally, we can actually execute the request
+            if request.raw:
+                response = client.send(request.request, auth=request.auth)
+            else:
+                for attempt in retry_context():
+                    with attempt:
+                        response = handle_error(
+                            client.send(request.request, auth=request.auth)
+                        )
+        except Exception as exc:
+            requestor.throw(exc)
+
+
+async def send_requests_async[
+    T
+](
+    requestor: Generator[
+        tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T
+    ]
+) -> T:
+    """Perform an HTTP request using an asynchronous *http_client* on behalf of *requestor*."""
+    # Prime the generator
+    response = None
+    while True:
+        try:
+            request = requestor.send(response)
+        except StopIteration as exc:
+            return exc.value
+        try:
+            # Create a default client if one is not explicitly given
+            client = httpx.AsyncClient() if request.client is None else request.client
+            # Finally, we can actually execute the request
+            if request.raw:
+                response = client.send(request.request, auth=request.auth)
+            else:
+                for attempt in retry_context():
+                    with attempt:
+                        response = handle_error(
+                            await client.send(request.request, auth=request.auth)
+                        )
+        except Exception as exc:
+            requestor.throw(exc)
+
+
+async def send_requests_generator_async[
+    T
+](
+    requestor: Generator[
+        tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T
+    ]
+) -> Generator[T, Any, None]:
+    """Perform an HTTP request using an asynchronous *http_client* on behalf of *requestor*."""
+    # Prime the generator
+    response = None
+    while True:
+        try:
+            request = requestor.send(response)
+        except StopIteration:
+            return  # Async generators can't return a value
+        # Check if yielded item should be passed through (not an HTTP request)
+        if not isinstance(request, TiledRequest):
+            yield request
+            continue
+        try:
+            # Create a default client if one is not explicitly given
+            client = httpx.AsyncClient() if request.client is None else request.client
+            # Finally, we can actually execute the request
+            if request.raw:
+                response = client.send(request.request, auth=request.auth)
+            else:
+                for attempt in retry_context():
+                    with attempt:
+                        response = handle_error(
+                            await client.send(request.request, auth=request.auth)
+                        )
+        except Exception as exc:
+            requestor.throw(exc)
+
+
+def _find_context(obj) -> Context | None:
+    """Find the Context attached to an object.
+
+    Either obj.context, or the object itself, otherwise None
+
+    """
+    if isinstance(obj, Context):
+        return obj
+    return getattr(obj, "context", None)
