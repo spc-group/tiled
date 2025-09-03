@@ -503,8 +503,8 @@ class Context:
         self.server_info = server_info
         self.is_awaitable = awaitable
 
-    @requestor(asynchronous=False)
     @classmethod
+    @requestor(asynchronous=False)
     def from_any_uri(
         cls,
         uri,
