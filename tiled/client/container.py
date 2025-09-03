@@ -1357,7 +1357,7 @@ DEFAULT_STRUCTURE_CLIENT_DISPATCH = {
                 ("..dataframe", Container.__module__), "DataFrameClient"
             ),
             "xarray_dataset": _LazyLoad(
-                ("..xarray", Container.__module__), "DatasetClient"
+                ("..xarray", Container.__module__), "AsyncDatasetClient"
             ),
         }
     ),
