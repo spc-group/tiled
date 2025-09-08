@@ -3,11 +3,12 @@ from urllib.parse import parse_qs, urlparse
 import numpy
 import pandas.testing
 import pytest
+import pytest_asyncio
 from starlette.status import HTTP_400_BAD_REQUEST
 
 from ..adapters.dataframe import DataFrameAdapter
 from ..adapters.mapping import MapAdapter
-from ..client import Context, from_context, record_history
+from ..client import Context, from_context, from_context_async, record_history
 from ..serialization.table import deserialize_arrow
 from ..server.app import build_app
 from .utils import URL_LIMITS, fail_with_status_code
@@ -63,6 +64,13 @@ def context():
         yield context
 
 
+@pytest_asyncio.fixture(scope="module")
+async def async_context():
+    app = build_app(tree)
+    async with Context.from_app(app, awaitable=True) as context:
+        yield context
+
+
 def test_dataframe_basic(context):
     client = from_context(context)
     expected = tree["basic"].read()
@@ -70,6 +78,20 @@ def test_dataframe_basic(context):
     assert client["basic"].structure().npartitions == 3
     pandas.testing.assert_frame_equal(actual, expected)
     assert client["basic"].columns == list(expected.columns) == list(actual.columns)
+
+
+@pytest.mark.asyncio
+async def test_dataframe_basic_async(async_context):
+    client = await from_context_async(async_context)
+    expected = tree["basic"].read()
+    actual = await (await client["basic"]).read()
+    assert (await client["basic"]).structure().npartitions == 3
+    pandas.testing.assert_frame_equal(actual, expected)
+    assert (
+        (await client["basic"]).columns
+        == list(expected.columns)
+        == list(actual.columns)
+    )
 
 
 def test_dataframe_column_access(context):

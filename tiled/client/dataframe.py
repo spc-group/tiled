@@ -1,13 +1,13 @@
+import asyncio
 import functools
 import warnings
 from collections.abc import Generator
 from urllib.parse import parse_qs, urlparse
 
-
 import dask
 import dask.dataframe
-import pandas as pd
 import httpx
+import pandas as pd
 
 from ..serialization.table import deserialize_arrow, serialize_arrow
 from ..utils import APACHE_ARROW_FILE_MIME_TYPE, UNCHANGED
@@ -19,7 +19,6 @@ from .utils import (
     client_for_item,
     export_util,
     handle_error,
-    retry_context,
 )
 
 _EXTRA_CHARS_PER_ITEM = len("&column=")
@@ -225,9 +224,7 @@ class _DaskDataFrameClient(BaseClient):
         yield self.context.build_request(
             "PUT",
             self.item["links"]["full"],
-            content=bytes(
-                serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})
-            ),
+            content=bytes(serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})),
             headers={"Content-Type": APACHE_ARROW_FILE_MIME_TYPE},
         )
 
@@ -245,9 +242,7 @@ class _DaskDataFrameClient(BaseClient):
         yield self.context.build_request(
             "PUT",
             self.item["links"]["partition"].format(index=partition),
-            content=bytes(
-                serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})
-            ),
+            content=bytes(serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})),
             headers={"Content-Type": APACHE_ARROW_FILE_MIME_TYPE},
         )
 
@@ -266,9 +261,7 @@ class _DaskDataFrameClient(BaseClient):
         yield self.context.build_request(
             "PATCH",
             self.item["links"]["partition"].format(index=partition),
-            content=bytes(
-                serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})
-            ),
+            content=bytes(serialize_arrow(APACHE_ARROW_FILE_MIME_TYPE, dataframe, {})),
             headers={"Content-Type": APACHE_ARROW_FILE_MIME_TYPE},
         )
 
@@ -292,13 +285,15 @@ class _DaskDataFrameClient(BaseClient):
         if columns is not None:
             params["column"] = columns
 
-        return (yield from export_util(
-            filepath,
-            format,
-            self.context.build_request,
-            self.item["links"]["full"],
-            params=params,
-        ))
+        return (
+            yield from export_util(
+                filepath,
+                format,
+                self.context.build_request,
+                self.item["links"]["full"],
+                params=params,
+            )
+        )
 
 
 # Subclass with a public class that adds the dask-specific methods.
@@ -326,3 +321,20 @@ class DataFrameClient(_DaskDataFrameClient):
         Access the entire DataFrame. Optionally select a subset of the columns.
         """
         return super().read(columns).compute()
+
+
+class AsyncDataFrameClient(_DaskDataFrameClient):
+    async def read(self, columns=None):
+        """
+        Access the entire DataFrame. Optionally select a subset of the columns.
+
+        The result will be internally partitioned with dask.
+        """
+        structure = self.structure()
+        async with asyncio.TaskGroup() as tg:
+            tasks = [
+                tg.create_task(self._get_partition(pidx, columns))
+                for pidx in range(structure.npartitions)
+            ]
+        df = pd.concat([task.result() for task in tasks])
+        return df

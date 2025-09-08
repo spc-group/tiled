@@ -34,9 +34,7 @@ from .utils import (
     ClientError,
     client_for_item,
     export_util,
-    handle_error,
     normalize_specs,
-    retry_context,
 )
 
 if TYPE_CHECKING:
@@ -193,20 +191,6 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                 # Used the cached value and do not make any request.
                 return length
         link = self.item["links"]["search"]
-        for attempt in retry_context():
-            with attempt:
-                content = handle_error(
-                    self.context.http_client.get(
-                        link,
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                        params={
-                            **parse_qs(urlparse(link).query),
-                            "fields": "count",
-                            **self._queries_as_params,
-                            **self._sorting_params,
-                        },
-                    )
-                ).json()
         content = (
             yield self.context.build_request(
                 "GET",
@@ -1380,7 +1364,7 @@ DEFAULT_STRUCTURE_CLIENT_DISPATCH = {
             "array": _LazyLoad(("..array", Container.__module__), "AsyncArrayClient"),
             "awkward": _LazyLoad(("..awkward", Container.__module__), "AwkwardClient"),
             "dataframe": _LazyLoad(
-                ("..dataframe", Container.__module__), "DataFrameClient"
+                ("..dataframe", Container.__module__), "AsyncDataFrameClient"
             ),
             "sparse": _LazyLoad(("..sparse", Container.__module__), "SparseClient"),
             "table": _LazyLoad(
