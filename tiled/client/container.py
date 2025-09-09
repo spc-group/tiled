@@ -1359,7 +1359,7 @@ DEFAULT_STRUCTURE_CLIENT_DISPATCH = {
         {
             "container": _Wrap(AsyncContainer),
             "composite": _LazyLoad(
-                ("..composite", Container.__module__), "AsyncComposite"
+                ("..composite", Container.__module__), "AsyncCompositeClient"
             ),
             "array": _LazyLoad(("..array", Container.__module__), "AsyncArrayClient"),
             "awkward": _LazyLoad(("..awkward", Container.__module__), "AwkwardClient"),
@@ -1379,7 +1379,7 @@ DEFAULT_STRUCTURE_CLIENT_DISPATCH = {
         {
             "container": _Wrap(AsyncContainer),
             "composite": _LazyLoad(
-                ("..composite", Container.__module__), "AsyncComposite"
+                ("..composite", Container.__module__), "AsyncCompositeClient"
             ),
             "array": _LazyLoad(
                 ("..array", Container.__module__), "DaskAsyncArrayClient"
