@@ -8,8 +8,8 @@ import httpx
 
 from ..utils import import_object, prepend_to_sys_path
 from .container import DEFAULT_STRUCTURE_CLIENT_DISPATCH, Container
-from .context import DEFAULT_TIMEOUT_PARAMS, UNSET, Context, send_requests, send_requests_async, requestor
-from .utils import MSGPACK_MIME_TYPE, client_for_item, handle_error, retry_context
+from .context import DEFAULT_TIMEOUT_PARAMS, UNSET, Context, requestor
+from .utils import MSGPACK_MIME_TYPE, client_for_item
 
 
 def from_uri(
@@ -91,14 +91,16 @@ For non-interactive authentication, use an API key.
         awaitable=awaitable,
     )
     yield from context.connect()
-    return (yield from build_from_context(
-        context,
-        structure_clients=structure_clients,
-        node_path_parts=node_path_parts,
-        include_data_sources=include_data_sources,
-        remember_me=remember_me,
-        awaitable=awaitable,
-    ))
+    return (
+        yield from build_from_context(
+            context,
+            structure_clients=structure_clients,
+            node_path_parts=node_path_parts,
+            include_data_sources=include_data_sources,
+            remember_me=remember_me,
+            awaitable=awaitable,
+        )
+    )
 
 
 def from_context(
@@ -127,7 +129,9 @@ def from_context(
         Container.discover_clients_from_entrypoints()
     # Interpret structure_clients="numpy" and structure_clients="dask" shortcuts.
     if isinstance(structure_clients, str):
-        struct_clients_key = structure_clients + "_async" if awaitable else structure_clients
+        struct_clients_key = (
+            structure_clients + "_async" if awaitable else structure_clients
+        )
         structure_clients = DEFAULT_STRUCTURE_CLIENT_DISPATCH[struct_clients_key]
     # To construct a user-facing client object, we may be required to authenticate.
     # 1. If any API key set, we are already authenticated and there is nothing to do.
@@ -148,12 +152,15 @@ def from_context(
             found_valid_tokens = remember_me and context.use_cached_tokens()
             if (not found_valid_tokens) and auth_is_required:
                 # Bundle the request with the context so other constructors have it
-                yield from context.authenticate.__wrapped__(context, remember_me=remember_me)
+                yield from context.authenticate.__wrapped__(
+                    context, remember_me=remember_me
+                )
     # Context ensures that context.api_uri has a trailing slash.
     item_uri = f"{context.api_uri}metadata/{'/'.join(node_path_parts)}"
     params = parse_qs(urlparse(item_uri).query)
     if include_data_sources:
         params["include_data_sources"] = include_data_sources
+    print(item_uri)
     content = (
         yield context.build_request(
             "GET",
@@ -264,7 +271,8 @@ def from_profile(name, structure_clients=None, **kwargs):
                 f"ValidationError while parsing configuration file {filepath}: {msg}"
             ) from err
         context = yield from Context.from_app.__wrapped__(
-            Context, build_app_from_config(config, source_filepath=filepath),
+            Context,
+            build_app_from_config(config, source_filepath=filepath),
         )
         return (yield from build_from_context(context, **merged))
     else:

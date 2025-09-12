@@ -286,10 +286,12 @@ class Context:
             client.headers = headers
         elif awaitable:
             # https://tekmusings.com/why-starlette-test-client-breaks-your-pytest-asyncio-tests.html
+            base_uri = f"{uri.scheme}://{uri.netloc}"
             client = httpx.AsyncClient(
                 transport=AsyncTransport(transport=httpx.ASGITransport(app)),
                 verify=False,
                 follow_redirects=True,
+                base_url=base_uri,
             )
             client.app = app
         else:
@@ -680,7 +682,7 @@ class Context:
                     "scopes": scopes,
                     "access_tags": access_tags,
                     "expires_in": expires_in,
-                    "note": note
+                    "note": note,
                 },
             )
         ).json()

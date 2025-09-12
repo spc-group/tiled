@@ -9,7 +9,7 @@ import xarray
 from starlette.status import HTTP_409_CONFLICT
 
 from ..catalog import in_memory
-from ..client import Context, from_context
+from ..client import Context, from_context, from_context_async
 from ..client.composite import CompositeClient
 from ..client.container import Container
 from ..client.utils import ClientError
@@ -215,6 +215,28 @@ def test_reading(context, name, expected):
     assert numpy.array_equal(actual, expected)
 
 
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("A", df1["A"]),
+        ("B", df1["B"]),
+        ("C", df2["C"]),
+        ("D", df2["D"]),
+        ("E", df2["E"]),
+        ("arr1", arr1),
+        ("arr2", arr2),
+        ("awk", awk_arr),
+        ("sps", sps_arr.todense()),
+    ],
+)
+def test_reading_async(context_async, name, expected):
+    client = from_context_async(context)
+    actual = client["x"][name].read()
+    if name == "sps":
+        actual = actual.todense()
+    assert numpy.array_equal(actual, expected)
+
+
 def test_iterate_parts(context):
     client = from_context(context)
     for part in client["x"].base:
@@ -405,6 +427,19 @@ def test_write_one_table(tree):
         df = pandas.DataFrame({"A": [], "B": []})
         client.create_container(key="z", specs=["composite"])
         client["z"].write_table(df)
+        assert len(client["z"].base) == 1  # One table
+        assert len(client["z"]) == 2  # Two columns
+
+
+@pytest.mark.asyncio
+async def test_write_table_async(tree):
+    # For some reason, there's no `nodes` table when doing this async
+    async with Context.from_app(build_app(tree), awaitable=True) as context:
+        client = await from_context_async(context)
+        df = pandas.DataFrame({"A": [], "B": []})
+        await client.create_container(key="z", specs=["composite"])
+        z = await client["z"]
+        await z.write_table(df)
         assert len(client["z"].base) == 1  # One table
         assert len(client["z"]) == 2  # Two columns
 
