@@ -1,3 +1,4 @@
+import asyncio
 import threading
 from urllib.parse import parse_qs, urlparse
 
@@ -32,6 +33,7 @@ class DaskDatasetClient(Container):
         """
         return list(self)
 
+    @requestor()
     def _build_arrays(self, variables, optimize_wide_table):
         data_vars = {}
         coords = {}
@@ -47,7 +49,7 @@ class DaskDatasetClient(Container):
         first_dims = []
         for maybe_client in self._items_slice.__wrapped__(self, 0, None, 1):
             if isinstance(maybe_client, TiledRequest):
-                yield maybe_client
+                name, array_client = yield maybe_client
             else:
                 name, array_client = maybe_client
             if (variables is not None) and (name not in variables):
@@ -95,13 +97,13 @@ class DaskDatasetClient(Container):
                 if "xarray_coord" in spec_names:
                     coords[name] = (
                         array_client.dims,
-                        array_client.read.__wrapped__(self),
+                        array_client.read(),
                         array_client.metadata["attrs"],
                     )
                 elif "xarray_data_var" in spec_names:
                     data_vars[name] = (
                         array_client.dims,
-                        array_client.read.__wrapped__(self),
+                        array_client.read(),
                         array_client.metadata["attrs"],
                     )
                 else:
@@ -111,11 +113,8 @@ class DaskDatasetClient(Container):
                     )
         return data_vars, coords
 
-    @requestor()
     def read(self, variables=None, *, optimize_wide_table=True):
-        data_vars, coords = yield from self._build_arrays(
-            variables, optimize_wide_table
-        )
+        data_vars, coords = self._build_arrays(variables, optimize_wide_table)
         return xarray.Dataset(
             data_vars=data_vars, coords=coords, attrs=self.metadata["attrs"]
         )
@@ -133,6 +132,30 @@ class DatasetClient(DaskDatasetClient):
 class AsyncDatasetClient(DaskDatasetClient):
     def __repr__(self):
         return f"<AsyncDatasetClient {self.uri}>"
+
+    async def read(self, variables=None, *, optimize_wide_table=True):
+        data_vars, coords = await self._build_arrays(variables, optimize_wide_table)
+        # build_arrays() gives us coroutines from the clients, now resolve them
+
+        async def resolve_coros(coll):
+            if len(coll) == 0:
+                return coll
+            keys, dims, aws, attrs = zip(
+                *[(key, dim, aw, attr) for key, (dim, aw, attr) in coll.items()]
+            )
+            vals = await asyncio.gather(*aws)
+            return {
+                key: (dim, val, attr)
+                for key, dim, val, attr in zip(keys, dims, vals, attrs)
+            }
+
+        data_vars, coords = await asyncio.gather(
+            resolve_coros(data_vars),
+            resolve_coros(coords),
+        )
+        return xarray.Dataset(
+            data_vars=data_vars, coords=coords, attrs=self.metadata["attrs"]
+        )
 
 
 _EXTRA_CHARS_PER_ITEM = len("&field=")
@@ -160,7 +183,6 @@ class _WideTableFetcher:
             dtype=array_structure.data_type.to_numpy_dtype(),
         )
 
-    @requestor()
     def dataframe(self):
         with self._lock:
             if self._dataframe is None:
@@ -171,12 +193,13 @@ class _WideTableFetcher:
                     _EXTRA_CHARS_PER_ITEM + len(variable) for variable in self.variables
                 )
                 if url_length_for_get_request > BaseClient.URL_CHARACTER_LIMIT:
-                    dataframe = yield from self._fetch_variables(self.variables, "POST")
+                    dataframe = self._fetch_variables(self.variables, "POST")
                 else:
-                    dataframe = yield from self._fetch_variables(self.variables, "GET")
+                    dataframe = self._fetch_variables(self.variables, "GET")
                 self._dataframe = dataframe.reset_index()
         return self._dataframe
 
+    @requestor()
     def _fetch_variables(self, variables, method="GET"):
         if method == "GET":
             return (yield from self._fetch_variables__get(variables))
@@ -214,8 +237,28 @@ class _WideTableFetcher:
 
 
 class _WideTableAsyncFetcher(_WideTableFetcher):
+    def __init__(self, context, link):
+        super().__init__(context, link)
+        # Replace the parent's synchronous lock
+        # This lock ensures that multiple threads (e.g. dask worker threads)
+        # do not prompts us to re-request the same data. Only the first worker
+        # to ask for the data should trigger a request.
+        self._lock = asyncio.Lock()
+
+    def register(self, name, array_client, array_structure):
+        if self._dataframe is not None:
+            raise RuntimeError("Cannot add variables; already fetched.")
+        self.variables.append(name)
+
+        # TODO Can we avoid .values here?
+        async def fetch_array():
+            return (await self.dataframe())[name].values
+
+        # Return just the coroutine so it can be awaited later
+        return fetch_array()
+
     async def dataframe(self):
-        with self._lock:
+        async with self._lock:
             if self._dataframe is None:
                 # If self.variables contains many and/or lengthy names,
                 # we can bump into the URI size limit commonly imposed by

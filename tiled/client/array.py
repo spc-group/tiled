@@ -421,11 +421,28 @@ class ArrayClient(DaskArrayClient):
 class AsyncArrayClient(DaskArrayClient):
     "Asynchronous client-side wrapper around an array-like that returns in-memory arrays"
 
-    async def read(self, slice=None):
+    @requestor()
+    def read(self, slice=None):
         """
         Access the entire array or a slice.
         """
-        return await super().read(slice).compute()
+        structure = self.structure()
+        dtype = structure.data_type.to_numpy_dtype()
+        # Build a client-side dask array whose chunks pull from a server-side
+        # dask array.
+        chunks = structure.chunks
+        # Count the number of blocks along each axis.
+        num_blocks = (range(len(n)) for n in chunks)
+        # Loop over each block index --- e.g. (0, 0), (0, 1), (0, 2) … ---
+        # and fetch the blocks in parallel.
+        blocks = yield [
+            self._get_block.__wrapped__(
+                self, block, dtype, tuple(chunks[dim][i] for dim, i in enumerate(block))
+            )
+            for block in itertools.product(*num_blocks)
+        ]
+        arr = numpy.concatenate(blocks)
+        return arr
 
     async def read_block(self, block, slice=None):
         """

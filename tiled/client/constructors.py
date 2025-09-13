@@ -160,7 +160,6 @@ def from_context(
     params = parse_qs(urlparse(item_uri).query)
     if include_data_sources:
         params["include_data_sources"] = include_data_sources
-    print(item_uri)
     content = (
         yield context.build_request(
             "GET",

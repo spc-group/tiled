@@ -71,7 +71,7 @@ tree = MapAdapter(
 @pytest_asyncio.fixture(scope="module")
 async def async_client():
     app = build_app(tree)
-    async with (await Context.from_app_async(app, awaitable=True)) as context:
+    async with Context.from_app(app, awaitable=True) as context:
         client = await from_context_async(context)
         yield client
 
@@ -96,9 +96,8 @@ def test_xarray_dataset(client, key):
 async def test_xarray_dataset_async(async_client, key):
     client = async_client
     expected = EXPECTED[key]
-    xarr = await (await client[key]).read()
-    print(xarr)
-    actual = (().read()).load()
+    node = await client[key]
+    actual = await node.read(optimize_wide_table=True)
     xarray.testing.assert_identical(actual, expected)
 
 

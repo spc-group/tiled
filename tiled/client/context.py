@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import functools
 import getpass
@@ -7,7 +8,7 @@ import sys
 import time
 import urllib.parse
 import warnings
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
 from typing import Any, List, Literal
 from urllib.parse import parse_qs, urlparse
@@ -1257,8 +1258,11 @@ async def send_requests_async[
     T
 ](
     requestor: Generator[
-        tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T
-    ]
+        # Yield type is wrong, need to come back and fix
+        TiledRequest | Sequence[Generator],
+        httpx.Response,
+        T,
+    ],
 ) -> T:
     """Perform an HTTP request using an asynchronous *http_client* on behalf of *requestor*."""
     # Prime the generator
@@ -1268,6 +1272,12 @@ async def send_requests_async[
             request = requestor.send(response)
         except StopIteration as exc:
             return exc.value
+        # Sequences of request generators so we can do them concurrently
+        if isinstance(request, Sequence):
+            response = await asyncio.gather(
+                *(send_requests_async(sub_requestor) for sub_requestor in request)
+            )
+            continue
         try:
             # Create a default client if one is not explicitly given
             client = httpx.AsyncClient() if request.client is None else request.client
