@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 
 class CompositeOverlay:
+    @requestor()
     def get_contents(self, maxlen=None, include_metadata=False):
         result = {}
         next_page_url = f"{self.item['links']['search']}"
@@ -44,7 +45,7 @@ class CompositeOverlay:
     @property
     def _flat_keys_mapping(self):
         result = {}
-        contents = yield from self.get_contents()
+        contents = yield from self.get_contents.__wrapped__(self)
         for key, item in contents.items():
             if item["attributes"]["structure_family"] == StructureFamily.table:
                 for col in item["attributes"]["structure"]["columns"]:
@@ -144,7 +145,6 @@ class CompositeOverlay:
 
         return super().delete_contents(keys, external_only=external_only)
 
-    @requestor()
     def read(self, variables=None, dim0=None):
         """Download the contents of a composite node as an xarray.Dataset.
 
@@ -302,7 +302,98 @@ class CompositeClient(CompositeOverlay, Container):
         yield from self._keys_slice(0, None, 1)
 
 
+# Just copied the sync implementation for now.
+# It's not very DRY. We should come back and dry this out.
+
+
 class AsyncCompositeClient(CompositeOverlay, AsyncContainer):
     async def __aiter__(self):
         async for key in self._keys_slice(0, None, 1):
             yield key
+
+    async def read(self, variables=None, dim0=None):
+        """Download the contents of a composite node as an xarray.Dataset.
+
+        Parameters
+        ----------
+        variables (list, optional) : List of variable names to read. If None, all
+            variables are read. Defaults to None.
+        dim0 (str, optional) : Name of the dimension to use for the first dimension;
+            if None (default), each array will have its own dimension name. The dims tuple,
+            if specified in the structure, takes precedence over this.
+
+        Returns
+        -------
+        xarray.Dataset: The dataset containing the requested variables.
+        """
+        import pandas
+        import xarray
+
+        array_dims = {}
+        data_vars = {}
+        contents = await self.get_contents()
+        for part, item in contents.items():
+            # Read all or selective arrays/columns.
+            if item["attributes"]["structure_family"] in {
+                StructureFamily.array,
+                StructureFamily.sparse,
+            }:
+                if (variables is None) or (part in variables):
+                    array_client = await self.base[part]
+                    data_vars[part] = await array_client.read()  # [Dask]ArrayClient
+                    array_dims[part] = array_client.dims
+            elif item["attributes"]["structure_family"] == StructureFamily.awkward:
+                if (variables is None) or (part in variables):
+                    try:
+                        data_vars[part] = self.base[part].read().to_numpy()
+                    except ValueError as e:
+                        raise ValueError(
+                            f"Failed to convert awkward array to numpy: {e}"
+                        ) from e
+            elif item["attributes"]["structure_family"] == StructureFamily.table:
+                # For now, greedily load tabular data. We cannot know the shape
+                # of the columns without reading them. Future work may enable
+                # this to be lazy.
+                table_client = await self.base[part]
+                columns = set(variables or table_client.columns).intersection(
+                    table_client.columns
+                )
+                df = await table_client.read(list(columns))
+                for column in columns:
+                    data_vars[column] = df[column].values
+                    # Convert (experimental) pandas.StringDtype to numpy's unicode string dtype
+                    if isinstance(data_vars[column].dtype, pandas.StringDtype):
+                        data_vars[column] = data_vars[column].astype("U")
+            else:
+                raise ValueError(
+                    f"Unsupported structure family: {item['attributes']['structure_family']}"
+                )
+
+        # Create xarray.Dataset from the data_vars dictionary
+        is_dim0_consistent = (
+            len(
+                set(
+                    [
+                        arr.shape[0]
+                        for var_name, arr in data_vars.items()
+                        if arr.ndim > 0 and not array_dims.get(var_name)
+                    ]
+                )
+            )
+            <= 1
+        )
+        if dim0 is not None and not is_dim0_consistent:
+            raise ValueError(
+                "Cannot specify dim0 when the arrays have different left-most dimensions."
+            )
+
+        for var_name, arr in data_vars.items():
+            if is_dim0_consistent:
+                dims = (dim0 or "dim0",) + tuple(
+                    f"{var_name}_dim{i+1}" for i in range(len(arr.shape) - 1)
+                )
+            else:
+                dims = tuple(f"{var_name}_dim{i}" for i in range(len(arr.shape)))
+            data_vars[var_name] = array_dims.get(var_name) or dims, arr
+
+        return xarray.Dataset(data_vars=data_vars)
