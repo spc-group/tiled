@@ -9,6 +9,8 @@ import time
 import urllib.parse
 import warnings
 from collections.abc import Callable, Generator, Sequence
+from contextlib import AbstractAsyncContextManager as ContextManager
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, List, Literal
 from urllib.parse import parse_qs, urlparse
@@ -33,6 +35,8 @@ from .utils import (
 
 USER_AGENT = f"python-tiled/{tiled_version}"
 API_KEY_AUTH_HEADER_PATTERN = re.compile(r"^Apikey (\w+)$")
+
+DEFAULT_POOL_SIZE = 100
 
 
 def raise_if_cannot_prompt():
@@ -155,6 +159,7 @@ class TiledRequest:
     request: httpx.Request
     auth: httpx.Auth = httpx._client.UseClientDefault()
     raw: bool = False
+    lock: ContextManager = nullcontext()
 
 
 def requestor(generator: bool = False, asynchronous: bool | None = None) -> Callable:
@@ -283,6 +288,9 @@ class Context:
                 timeout=timeout,
                 follow_redirects=True,
             )
+            self._connection_lock = (
+                asyncio.Semaphore(DEFAULT_POOL_SIZE) if awaitable else nullcontext()
+            )
             # Do this in the setter to avoid being overwritten.
             client.headers = headers
         elif awaitable:
@@ -295,6 +303,7 @@ class Context:
                 base_url=base_uri,
             )
             client.app = app
+            self._connection_lock = nullcontext()
         else:
             # Set up an ASGI client.
             # Because we have been handed an app, we can infer that
@@ -308,6 +317,7 @@ class Context:
                 raise_server_exceptions=raise_server_exceptions,
                 base_url=base_uri,
             )
+            self._connection_lock = nullcontext()
             client.timeout = timeout
             client.headers = headers
             # Do this in the setter to avoid being overwritten.
@@ -395,6 +405,7 @@ class Context:
             request=request,
             auth=auth,
             raw=raw,
+            lock=self._connection_lock,
         )
 
     def __repr__(self):
@@ -499,6 +510,9 @@ class Context:
             headers=headers,
             follow_redirects=True,
             auth=auth,
+        )
+        self._connection_lock = (
+            asyncio.Semaphore(DEFAULT_POOL_SIZE) if awaitable else nullcontext()
         )
         self._token_cache = token_cache
         self._cache = cache
@@ -1231,13 +1245,14 @@ def send_requests_generator[
     response = None
     while True:
         try:
-            request = requestor.send(response)
+            maybe_request = requestor.send(response)
         except StopIteration as exc:
             return exc.value
         # Check if yielded item should be passed through (not an HTTP request)
-        if not isinstance(request, TiledRequest):
-            yield request
+        if not isinstance(maybe_request, TiledRequest):
+            yield maybe_request
             continue
+        request = maybe_request
         try:
             # Create a default client if one is not explicitly given
             client = httpx.Client() if request.client is None else request.client
@@ -1286,10 +1301,11 @@ async def send_requests_async[
                 response = client.send(request.request, auth=request.auth)
             else:
                 for attempt in retry_context():
-                    with attempt:
-                        response = handle_error(
-                            await client.send(request.request, auth=request.auth)
-                        )
+                    async with request.lock:  # Avoid overwhelming the connection pool
+                        with attempt:
+                            response = handle_error(
+                                await client.send(request.request, auth=request.auth)
+                            )
         except Exception as exc:
             requestor.throw(exc)
 
@@ -1306,13 +1322,14 @@ async def send_requests_generator_async[
     response = None
     while True:
         try:
-            request = requestor.send(response)
+            maybe_request = requestor.send(response)
         except StopIteration:
             return  # Async generators can't return a value
         # Check if yielded item should be passed through (not an HTTP request)
-        if not isinstance(request, TiledRequest):
-            yield request
+        if not isinstance(maybe_request, TiledRequest):
+            yield maybe_request
             continue
+        request = maybe_request
         try:
             # Create a default client if one is not explicitly given
             client = httpx.AsyncClient() if request.client is None else request.client
@@ -1321,10 +1338,11 @@ async def send_requests_generator_async[
                 response = client.send(request.request, auth=request.auth)
             else:
                 for attempt in retry_context():
-                    with attempt:
-                        response = handle_error(
-                            await client.send(request.request, auth=request.auth)
-                        )
+                    async with request.lock:  # Avoid overwhelming the connection pool
+                        with attempt:
+                            response = handle_error(
+                                await client.send(request.request, auth=request.auth)
+                            )
         except Exception as exc:
             requestor.throw(exc)
 

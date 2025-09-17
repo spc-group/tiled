@@ -192,7 +192,6 @@ class CompositeOverlay:
                 columns = set(variables or table_client.columns).intersection(
                     table_client.columns
                 )
-                print(table_client.read)
                 df = table_client.read(list(columns))
                 for column in columns:
                     data_vars[column] = df[column].values
