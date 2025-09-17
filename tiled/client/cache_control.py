@@ -97,7 +97,7 @@ class ByteStreamWrapper(httpx.ByteStream):
         async for chunk in self.stream:
             self.content.extend(chunk)
             yield chunk
-        await self.callback(bytes(self.content))
+        self.callback(bytes(self.content))
 
 
 class CacheControl:
